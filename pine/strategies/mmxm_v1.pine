@@ -1,0 +1,470 @@
+//@version=6
+// ICT MMXM v1 (test) — Market Maker Sell / Buy Model on the chart timeframe, HTF dealing-range context.
+// Spec: kb/mmxm-spec.md (v1). User decisions: OC-A box, SMR-D confirmation score, trade-through breaks,
+// partials at re-accumulation / re-distribution levels, stop -> entry after TP1, runner -> original consolidation.
+// v1 limits (see pine/README.md): one detection TF (= chart TF), low-risk entries only (E1 IFVG / E2 first FVG),
+// no stage-2 re-entry, no session-phase classifier yet (HRLR overlap filter + macro filter only).
+strategy("ICT MMXM v1 (test)", "MMXM v1", overlay = true, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 4,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1,
+     process_orders_on_close = false, calc_on_every_tick = false, pyramiding = 0,
+     margin_long = 0, margin_short = 0, max_boxes_count = 200, max_lines_count = 300, max_labels_count = 300)
+
+// ───────── Inputs
+gC = "Context (HTF dealing range)"
+htf      = input.timeframe("240", "HTF", group = gC)
+htfPivot = input.int(2, "HTF swing strength (bars each side)", minval = 1, group = gC)
+zoneOn   = input.bool(true, "Raid must be in HTF premium (sell) / discount (buy)", group = gC)
+
+gO = "Original consolidation (OC-A box)"
+ocLen     = input.int(20, "Box length (bars)", minval = 5, group = gO)
+ocK       = input.float(2.0, "Box max height (x ATR14)", step = 0.1, group = gO)
+ocTimeout = input.int(200, "OC valid for N bars", minval = 10, group = gO)
+showOC    = input.bool(true, "Draw OC box when a model starts", group = gO)
+
+gS = "SMR + confirmation score"
+swLen    = input.int(1, "Swing strength (1 = 3-bar swing)", minval = 1, group = gS)
+maxPools = input.int(10, "Tracked pools per side", minval = 1, maxval = 50, group = gS)
+smrWin   = input.int(20, "Raid -> confirmation window (bars)", minval = 3, group = gS)
+confMin  = input.float(3.0, "Min confirmation score", step = 0.5, group = gS)
+wCisd    = input.float(2.0, "Weight CISD (trade-through)", group = gS)
+wIfvg    = input.float(2.0, "Weight IFVG (body close)", group = gS)
+wMss     = input.float(1.5, "Weight MSS (trade-through)", group = gS)
+wOb      = input.float(1.0, "Weight OB validated (body close beyond key open)", group = gS)
+wSmt     = input.float(1.0, "Weight SMT", group = gS)
+wHtf     = input.float(1.0, "Weight HTF extreme quadrant", group = gS)
+wMac     = input.float(0.5, "Weight raid in macro", group = gS)
+wDisp    = input.float(0.5, "Weight displacement candle", group = gS)
+smtSym   = input.symbol("CME_MINI:ES1!", "SMT symbol (use NQ1! on ES charts)", group = gS)
+dispK    = input.float(1.2, "Displacement: body >= k x ATR14", step = 0.1, group = gS)
+
+gE = "Entry"
+entryMode = input.string("Either (IFVG first)", "Entry type", options = ["Either (IFVG first)", "First FVG after confirmation", "IFVG retest"], group = gE)
+edgeMode  = input.string("Near edge", "FVG limit price", options = ["Near edge", "CE"], group = gE)
+minFvgT   = input.int(4, "Min FVG size (ticks)", minval = 1, group = gE)
+armBars   = input.int(40, "Armed order expires after N bars", minval = 5, group = gE)
+
+gR = "Risk / management"
+nQty      = input.int(4, "Contracts per trade", minval = 3, group = gR)
+q1        = input.int(2, "TP1 contracts", minval = 1, group = gR)
+q2        = input.int(1, "TP2 contracts", minval = 1, group = gR)
+stopPad   = input.int(2, "Stop pad beyond SMR extreme (ticks)", minval = 0, group = gR)
+minRoom   = input.float(15.0, "Min room entry -> TP1 (points; NQ 15, ES 4)", minval = 0, group = gR)
+beAfterT1 = input.bool(true, "Stop to entry after TP1", group = gR)
+
+gT = "Time / filters (New York)"
+macroOn = input.bool(true, "Orders only in macro windows (xx:50-xx:10)", group = gT)
+macroLH = input.bool(true, "Also 15:15-15:45 last-hour macro", group = gT)
+flatOn  = input.bool(true, "Flat by time (intraday charts)", group = gT)
+flatH   = input.int(15, "Flat hour", minval = 0, maxval = 23, group = gT)
+flatM   = input.int(55, "Flat minute", minval = 0, maxval = 59, group = gT)
+hrOn    = input.bool(true, "HRLR filter: skip when candles overlap heavily", group = gT)
+hrLen   = input.int(12, "HRLR lookback (bars)", minval = 3, group = gT)
+hrThr   = input.float(0.6, "HRLR overlap threshold (0-1)", step = 0.05, group = gT)
+
+// ───────── Helpers
+mt  = syminfo.mintick
+atr = ta.atr(14)
+
+f_macro(t) =>
+    h = hour(t, "America/New_York")
+    m = minute(t, "America/New_York")
+    (m >= 50 or m < 10) or (macroLH and h == 15 and m >= 15 and m < 45)
+
+nyH = hour(time, "America/New_York")
+nyM = minute(time, "America/New_York")
+flatNow = flatOn and timeframe.isintraday and (nyH > flatH or (nyH == flatH and nyM >= flatM)) and nyH < 18
+
+ovl = math.max(0.0, math.min(high, high[1]) - math.max(low, low[1]))
+ovlRatio = high - low > 0 ? math.min(ovl / (high - low), 1.0) : 1.0
+ovlAvg = ta.sma(ovlRatio, hrLen)
+hrlrNow = hrOn and ovlAvg > hrThr
+
+// open of the consecutive same-colour run that made the latest extreme (CISD / OB key level)
+f_seriesOpen(bool up) =>
+    int s = 0
+    while s < 10 and (up ? close[s] <= open[s] : close[s] >= open[s])
+        s += 1
+    int e = s
+    while e < 30 and (up ? close[e + 1] > open[e + 1] : close[e + 1] < open[e + 1])
+        e += 1
+    open[e]
+
+// ───────── HTF dealing range (confirmed HTF bars only)
+htfCalc() =>
+    hph = ta.pivothigh(high, htfPivot, htfPivot)
+    hpl = ta.pivotlow(low, htfPivot, htfPivot)
+    sh = ta.valuewhen(not na(hph), hph, 0)
+    sl = ta.valuewhen(not na(hpl), hpl, 0)
+    [sh[1], sl[1]]
+[hSH, hSL] = request.security(syminfo.tickerid, htf, htfCalc(), lookahead = barmerge.lookahead_on)
+drHi = math.max(hSH, hSL)
+drLo = math.min(hSH, hSL)
+eq   = (drHi + drLo) / 2
+plot(eq, "HTF EQ (0.5)", color.new(color.gray, 40), 1, plot.style_stepline)
+
+// ───────── SMT partner
+oH = request.security(smtSym, timeframe.period, high, lookahead = barmerge.lookahead_off)
+oL = request.security(smtSym, timeframe.period, low, lookahead = barmerge.lookahead_off)
+oHpiv = ta.highest(oH, 2 * swLen + 1)
+oLpiv = ta.lowest(oL, 2 * swLen + 1)
+oH3 = ta.highest(oH, 3)
+oL3 = ta.lowest(oL, 3)
+
+// ───────── Original consolidation (OC-A box, from closed bars)
+hh1  = ta.highest(high, ocLen)[1]
+ll1  = ta.lowest(low, ocLen)[1]
+box1 = (hh1 - ll1) <= ocK * atr[1]
+var float ocHi = na
+var float ocLo = na
+var int   ocBar = na
+var int   ocStart = na
+if box1
+    if na(ocBar) or bar_index - 1 - ocBar > 1
+        ocStart := bar_index - ocLen
+    ocHi := hh1
+    ocLo := ll1
+    ocBar := bar_index - 1
+ocValid = not na(ocBar) and bar_index - ocBar <= ocTimeout
+
+// ───────── Swings, pools, FVGs
+ph = ta.pivothigh(high, swLen, swLen)
+pl = ta.pivotlow(low, swLen, swLen)
+var float lastSH = na
+var float lastSL = na
+var float[] bslP = array.new<float>()
+var float[] bslO = array.new<float>()
+var float[] sslP = array.new<float>()
+var float[] sslO = array.new<float>()
+
+f_push(float[] ap, float[] ao, float p, float o) =>
+    array.push(ap, p)
+    array.push(ao, o)
+    if array.size(ap) > maxPools
+        array.shift(ap)
+        array.shift(ao)
+
+if not na(ph)
+    lastSH := ph
+    f_push(bslP, bslO, ph, oHpiv)
+if not na(pl)
+    lastSL := pl
+    f_push(sslP, sslO, pl, oLpiv)
+
+f_sweep(float[] ap, float[] ao, bool isLow) =>
+    float best = na
+    float bestO = na
+    int i = array.size(ap) - 1
+    while i >= 0
+        p = array.get(ap, i)
+        if isLow ? low <= p - mt : high >= p + mt
+            if na(best) or (isLow ? p < best : p > best)
+                best := p
+                bestO := array.get(ao, i)
+            array.remove(ap, i)
+            array.remove(ao, i)
+        i -= 1
+    [best, bestO]
+
+[sslHit, sslHitO] = f_sweep(sslP, sslO, true)
+[bslHit, bslHitO] = f_sweep(bslP, bslO, false)
+
+bullFvg = low > high[2] and (low - high[2]) >= minFvgT * mt
+bearFvg = high < low[2] and (low[2] - high) >= minFvgT * mt
+var float lbfBot = na   // last bullish FVG bottom (sell-model IFVG level)
+var float lsfTop = na   // last bearish FVG top (buy-model IFVG level)
+if bullFvg
+    lbfBot := high[2]
+if bearFvg
+    lsfTop := low[2]
+
+// ═════════ SELL MODEL (MMSM)   states: 0 idle, 2 buy-side curve, 3 SMR zone, 5 armed, 6 in trade
+var int   sSt = 0
+var float sOcHi = na
+var float sOcLo = na
+var float[] sR = array.new<float>()
+var float sSmr = na
+var int   sRaidB = na
+var float sCisdL = na
+var float sMssL = na
+var float sIfvgL = na
+var bool  sSmt = false
+var bool  sMacR = false
+var bool  fC = false
+var bool  fI = false
+var bool  fM = false
+var bool  fO = false
+var bool  fD = false
+var float sScore = 0.0
+var string sComp = ""
+var int   sConfB = na
+var float sFvgLim = na
+var float sStop = na
+var float sTp1 = na
+var float sTp2 = na
+var float sDraw = na
+
+// ═════════ BUY MODEL (MMBM)   mirror
+var int   bSt = 0
+var float bOcHi = na
+var float bOcLo = na
+var float[] bR = array.new<float>()
+var float bSmr = na
+var int   bRaidB = na
+var float bCisdL = na
+var float bMssL = na
+var float bIfvgL = na
+var bool  bSmt = false
+var bool  bMacR = false
+var bool  gC2 = false
+var bool  gI = false
+var bool  gM = false
+var bool  gO2 = false
+var bool  gD = false
+var float bScore = 0.0
+var string bComp = ""
+var int   bConfB = na
+var float bFvgLim = na
+var float bStop = na
+var float bTp1 = na
+var float bTp2 = na
+var float bDraw = na
+
+f_ocBox(float hi, float lo) =>
+    if showOC
+        box.new(ocStart, hi, bar_index, lo, border_color = color.new(color.orange, 30), bgcolor = color.new(color.orange, 90), text = "OC", text_size = size.tiny, text_color = color.orange, text_halign = text.align_left, text_valign = text.align_top)
+
+// ── departures from the OC start a model
+if sSt == 0 and ocValid and close > ocHi and close[1] <= ocHi
+    sSt := 2
+    sOcHi := ocHi
+    sOcLo := ocLo
+    array.clear(sR)
+    f_ocBox(ocHi, ocLo)
+if bSt == 0 and ocValid and close < ocLo and close[1] >= ocLo
+    bSt := 2
+    bOcHi := ocHi
+    bOcLo := ocLo
+    array.clear(bR)
+    f_ocBox(ocHi, ocLo)
+
+// ── SELL: buy-side curve -> raid -> confirmation
+if sSt == 2
+    if not na(pl) and pl > sOcLo
+        array.push(sR, pl)
+    if close < sOcLo
+        sSt := 0
+    else if not na(bslHit) and (not zoneOn or high > eq)
+        sSt := 3
+        sSmr := high
+        sRaidB := bar_index
+        sCisdL := f_seriesOpen(true)
+        sMssL := lastSL
+        sIfvgL := lbfBot
+        sSmt := not na(bslHitO) and oH3 < bslHitO
+        sMacR := f_macro(time)
+        fC := false
+        fI := false
+        fM := false
+        fO := false
+        fD := false
+
+if sSt == 3
+    if high > sSmr
+        sSmr := high
+        sCisdL := f_seriesOpen(true)
+        fC := false
+        fI := false
+        fM := false
+        fO := false
+        fD := false
+    fC := fC or low <= sCisdL - mt
+    fI := fI or (not na(sIfvgL) and close < sIfvgL)
+    fM := fM or (not na(sMssL) and low <= sMssL - mt)
+    fO := fO or close < sCisdL
+    fD := fD or (close < open and open - close >= dispK * atr)
+    htfQ = not na(drHi) and sSmr >= drLo + 0.75 * (drHi - drLo)
+    sScore := (fC ? wCisd : 0) + (fI ? wIfvg : 0) + (fM ? wMss : 0) + (fO ? wOb : 0) + (sSmt ? wSmt : 0) + (htfQ ? wHtf : 0) + (sMacR ? wMac : 0) + (fD ? wDisp : 0)
+    if sScore >= confMin
+        sSt := 5
+        sConfB := bar_index
+        sFvgLim := na
+        sComp := (fC ? "C" : "") + (fI ? "I" : "") + (fM ? "M" : "") + (fO ? "O" : "") + (sSmt ? "S" : "") + (htfQ ? "H" : "") + (sMacR ? "m" : "") + (fD ? "D" : "")
+        label.new(bar_index, sSmr, "SMR " + str.tostring(sScore, "#.0") + " " + sComp, color = color.new(color.maroon, 100), textcolor = color.maroon, style = label.style_label_down, size = size.small)
+    else if bar_index - sRaidB > smrWin
+        sSt := 2
+
+// ── BUY: sell-side curve -> raid -> confirmation
+if bSt == 2
+    if not na(ph) and ph < bOcHi
+        array.push(bR, ph)
+    if close > bOcHi
+        bSt := 0
+    else if not na(sslHit) and (not zoneOn or low < eq)
+        bSt := 3
+        bSmr := low
+        bRaidB := bar_index
+        bCisdL := f_seriesOpen(false)
+        bMssL := lastSH
+        bIfvgL := lsfTop
+        bSmt := not na(sslHitO) and oL3 > sslHitO
+        bMacR := f_macro(time)
+        gC2 := false
+        gI := false
+        gM := false
+        gO2 := false
+        gD := false
+
+if bSt == 3
+    if low < bSmr
+        bSmr := low
+        bCisdL := f_seriesOpen(false)
+        gC2 := false
+        gI := false
+        gM := false
+        gO2 := false
+        gD := false
+    gC2 := gC2 or high >= bCisdL + mt
+    gI := gI or (not na(bIfvgL) and close > bIfvgL)
+    gM := gM or (not na(bMssL) and high >= bMssL + mt)
+    gO2 := gO2 or close > bCisdL
+    gD := gD or (close > open and close - open >= dispK * atr)
+    htfQb = not na(drHi) and bSmr <= drLo + 0.25 * (drHi - drLo)
+    bScore := (gC2 ? wCisd : 0) + (gI ? wIfvg : 0) + (gM ? wMss : 0) + (gO2 ? wOb : 0) + (bSmt ? wSmt : 0) + (htfQb ? wHtf : 0) + (bMacR ? wMac : 0) + (gD ? wDisp : 0)
+    if bScore >= confMin
+        bSt := 5
+        bConfB := bar_index
+        bFvgLim := na
+        bComp := (gC2 ? "C" : "") + (gI ? "I" : "") + (gM ? "M" : "") + (gO2 ? "O" : "") + (bSmt ? "S" : "") + (htfQb ? "H" : "") + (bMacR ? "m" : "") + (gD ? "D" : "")
+        label.new(bar_index, bSmr, "SMR " + str.tostring(bScore, "#.0") + " " + bComp, color = color.new(color.teal, 100), textcolor = color.teal, style = label.style_label_up, size = size.small)
+    else if bar_index - bRaidB > smrWin
+        bSt := 2
+
+// ───────── Armed: choose the entry array, targets, place limit + exits
+canTrade = not hrlrNow and not flatNow and (not macroOn or f_macro(time_close))
+
+if sSt == 5
+    if na(sFvgLim) and bearFvg and bar_index >= sConfB
+        sFvgLim := edgeMode == "Near edge" ? high : (high + low[2]) / 2
+    useI = entryMode != "First FVG after confirmation" and fI and not na(sIfvgL)
+    float lim = entryMode == "IFVG retest" ? (useI ? sIfvgL : na) : entryMode == "First FVG after confirmation" ? sFvgLim : (useI ? sIfvgL : sFvgLim)
+    float tp1 = na
+    float tp2 = na
+    draw = sOcLo
+    if not na(lim)
+        for r in sR
+            if r < lim - minRoom and r > draw and (na(tp1) or r > tp1)
+                tp1 := r
+        if na(tp1) and sOcHi < lim - minRoom and sOcHi > draw
+            tp1 := sOcHi
+        if not na(tp1)
+            for r in sR
+                if r < tp1 - mt and r > draw and (na(tp2) or r > tp2)
+                    tp2 := r
+            if na(tp2) and sOcHi < tp1 - mt and sOcHi > draw
+                tp2 := sOcHi
+            if na(tp2)
+                tp2 := (tp1 + draw) / 2
+    valid = not na(lim) and not na(tp1) and lim < sSmr and lim > tp1
+    if strategy.position_size < 0
+        sSt := 6
+    else if close > sSmr or bar_index - sConfB > armBars or (not na(tp1) and low <= tp1)
+        strategy.cancel("S")
+        sSt := 0
+    else if valid and canTrade and strategy.position_size == 0
+        sStop := sSmr + stopPad * mt
+        sTp1 := tp1
+        sTp2 := tp2
+        sDraw := draw
+        strategy.entry("S", strategy.short, qty = nQty, limit = lim, comment = "MMSM " + str.tostring(sScore, "#.0") + " " + sComp)
+        strategy.exit("S-TP1", "S", qty = q1, limit = sTp1, stop = sStop, comment_profit = "TP1", comment_loss = "SL")
+        strategy.exit("S-TP2", "S", qty = q2, limit = sTp2, stop = sStop, comment_profit = "TP2", comment_loss = "SL")
+        strategy.exit("S-RUN", "S", limit = sDraw, stop = sStop, comment_profit = "OC", comment_loss = "SL")
+    else
+        strategy.cancel("S")
+
+if bSt == 5
+    if na(bFvgLim) and bullFvg and bar_index >= bConfB
+        bFvgLim := edgeMode == "Near edge" ? low : (low + high[2]) / 2
+    useIb = entryMode != "First FVG after confirmation" and gI and not na(bIfvgL)
+    float limB = entryMode == "IFVG retest" ? (useIb ? bIfvgL : na) : entryMode == "First FVG after confirmation" ? bFvgLim : (useIb ? bIfvgL : bFvgLim)
+    float t1 = na
+    float t2 = na
+    drawB = bOcHi
+    if not na(limB)
+        for r in bR
+            if r > limB + minRoom and r < drawB and (na(t1) or r < t1)
+                t1 := r
+        if na(t1) and bOcLo > limB + minRoom and bOcLo < drawB
+            t1 := bOcLo
+        if not na(t1)
+            for r in bR
+                if r > t1 + mt and r < drawB and (na(t2) or r < t2)
+                    t2 := r
+            if na(t2) and bOcLo > t1 + mt and bOcLo < drawB
+                t2 := bOcLo
+            if na(t2)
+                t2 := (t1 + drawB) / 2
+    validB = not na(limB) and not na(t1) and limB > bSmr and limB < t1
+    if strategy.position_size > 0
+        bSt := 6
+    else if close < bSmr or bar_index - bConfB > armBars or (not na(t1) and high >= t1)
+        strategy.cancel("B")
+        bSt := 0
+    else if validB and canTrade and strategy.position_size == 0
+        bStop := bSmr - stopPad * mt
+        bTp1 := t1
+        bTp2 := t2
+        bDraw := drawB
+        strategy.entry("B", strategy.long, qty = nQty, limit = limB, comment = "MMBM " + str.tostring(bScore, "#.0") + " " + bComp)
+        strategy.exit("B-TP1", "B", qty = q1, limit = bTp1, stop = bStop, comment_profit = "TP1", comment_loss = "SL")
+        strategy.exit("B-TP2", "B", qty = q2, limit = bTp2, stop = bStop, comment_profit = "TP2", comment_loss = "SL")
+        strategy.exit("B-RUN", "B", limit = bDraw, stop = bStop, comment_profit = "OC", comment_loss = "SL")
+    else
+        strategy.cancel("B")
+
+// ───────── In trade: stop to entry after TP1, never widened
+pos = strategy.position_size
+if sSt == 6
+    if pos >= 0
+        sSt := 0
+    else
+        openQ = math.abs(pos)
+        st = beAfterT1 and openQ < nQty ? math.min(sStop, strategy.position_avg_price) : sStop
+        if openQ == nQty
+            strategy.exit("S-TP1", "S", qty = q1, limit = sTp1, stop = st, comment_profit = "TP1", comment_loss = "SL")
+        if openQ > nQty - q1 - q2
+            strategy.exit("S-TP2", "S", qty = q2, limit = sTp2, stop = st, comment_profit = "TP2", comment_loss = "SL/BE")
+        strategy.exit("S-RUN", "S", limit = sDraw, stop = st, comment_profit = "OC", comment_loss = "SL/BE")
+        strategy.cancel("B")
+if bSt == 6
+    if pos <= 0
+        bSt := 0
+    else
+        openQ = math.abs(pos)
+        st = beAfterT1 and openQ < nQty ? math.max(bStop, strategy.position_avg_price) : bStop
+        if openQ == nQty
+            strategy.exit("B-TP1", "B", qty = q1, limit = bTp1, stop = st, comment_profit = "TP1", comment_loss = "SL")
+        if openQ > nQty - q1 - q2
+            strategy.exit("B-TP2", "B", qty = q2, limit = bTp2, stop = st, comment_profit = "TP2", comment_loss = "SL/BE")
+        strategy.exit("B-RUN", "B", limit = bDraw, stop = st, comment_profit = "OC", comment_loss = "SL/BE")
+        strategy.cancel("S")
+
+// ───────── Flat by time
+if flatNow
+    strategy.cancel("S")
+    strategy.cancel("B")
+    if pos != 0
+        strategy.close_all(comment = "flat")
+    if sSt >= 5
+        sSt := 0
+    if bSt >= 5
+        bSt := 0
+
+// ───────── Plots
+inS = sSt == 6
+inB = bSt == 6
+plot(inS ? sTp1 : inB ? bTp1 : na, "TP1", color.new(color.green, 0), 1, plot.style_linebr)
+plot(inS ? sTp2 : inB ? bTp2 : na, "TP2", color.new(color.green, 40), 1, plot.style_linebr)
+plot(inS ? sDraw : inB ? bDraw : na, "Draw (OC)", color.new(color.blue, 0), 2, plot.style_linebr)
+plot(inS ? sStop : inB ? bStop : na, "Stop", color.new(color.red, 0), 1, plot.style_linebr)

@@ -1,0 +1,128 @@
+//@version=6
+// @description ICT-Bot time detectors: NY clock helpers, session/killzone ranges, opening prices, macros, NDOG/NWOG,
+// RTH opening range gap (ORG). All times America/New_York (never UTC offsets). Returns tuples (no UDTs) so the
+// library is independent of ict_core. Decisions a card left open are marked "DECISION" (see pine/README.md).
+library("ict_time", overlay = true)
+
+const string TZ = "America/New_York"
+
+// @function Minutes after NY midnight of timestamp t.
+export nyMin(int t) =>
+    hour(t, TZ) * 60 + minute(t, TZ)
+
+// @function NY calendar date of t as yyyymmdd.
+export nyDate(int t) =>
+    year(t, TZ) * 10000 + month(t, TZ) * 100 + dayofmonth(t, TZ)
+
+// @function True on the bar that STARTS exactly at hh:mm NY (opening-prices.md uses the open of that bar).
+export startsAt(int hh, int mm) =>
+    nyMin(time) == hh * 60 + mm
+
+// @function opening-prices.md VERIFIED. Open of the bar starting at hh:mm NY, held until the next occurrence.
+//   DECISION: if no bar starts exactly at hh:mm on this TF (e.g. 08:30 on 1H), the value stays na.
+// @returns [openPrice, isNewToday]
+export openAt(int hh, int mm) =>
+    var float op = na
+    bool hit = startsAt(hh, mm)
+    if hit
+        op := open
+    [op, hit]
+
+// @function True while the bar is inside session string sess (e.g. "0200-0500"), NY time.
+export inWindow(simple string sess) =>
+    not na(time(timeframe.period, sess, TZ))
+
+// @function session-ranges.md VERIFIED. Running high/low/open of window sess; values freeze after the window ends
+//   and reset on its next start. @returns [hi, lo, open, inSession, started, ended]
+export sessionRange(simple string sess) =>
+    var float hi = na
+    var float lo = na
+    var float op = na
+    bool inS = not na(time(timeframe.period, sess, TZ))
+    bool prev = inS[1]
+    bool started = inS and not prev
+    bool ended = not inS and prev
+    if started
+        hi := high
+        lo := low
+        op := open
+    else if inS
+        hi := math.max(hi, high)
+        lo := math.min(lo, low)
+    [hi, lo, op, inS, started, ended]
+
+// @function session-ranges.md L1 (day_boundary 18:00 = exchange daily session). Previous CME trading day high/low.
+//   DECISION: day boundary = TradingView's "D" session change (18:00 NY for CME_MINI).
+// @returns [pdh, pdl, newDay]
+export prevDayHL() =>
+    var float curH = na
+    var float curL = na
+    var float pdh = na
+    var float pdl = na
+    bool nd = timeframe.change("D")
+    if nd
+        pdh := curH
+        pdl := curL
+        curH := high
+        curL := low
+    else
+        curH := na(curH) ? high : math.max(curH, high)
+        curL := na(curL) ? low : math.min(curL, low)
+    [pdh, pdl, nd]
+
+// @function macros-time-windows.md VERIFIED. Hourly macro xx:50 -> xx+1:10 NY (by bar start time), padMin widens it;
+//   extra = 15:15-15:45 last-hour macro or 15:45-16:00 MOC. @returns [inHourlyMacro, inExtraMacro]
+export macro(int padMin = 0) =>
+    int m = minute(time, TZ)
+    int t = nyMin(time)
+    bool hourly = m >= 50 - padMin or m < 10 + padMin
+    bool extra = t >= 15 * 60 + 15 and t < 16 * 60
+    [hourly, extra]
+
+// @function ndog-nwog.md VERIFIED (nwog_anchor fri_1659_close). On the first bar starting 18:00 NY after the CME break:
+//   a = close of the last bar before 17:00 (close[1]), b = open. kind 1 = NDOG (bar on Mon-Thu), 2 = NWOG (Sunday),
+//   0 otherwise. Quadrants only when size >= quarterMin (else q25/q75 = na). Zone belongs to the NEXT trading day.
+//   DECISION: requires time_close[1] < time (a real break); holiday-week NWOG skip not implemented.
+// @returns [kind, top, bottom, ce, q25, q75]
+export openingGap(float quarterMin) =>
+    int kind = 0
+    float top = na
+    float bot = na
+    if startsAt(18, 0) and bar_index > 0 and time_close[1] < time
+        int dow = dayofweek(time, TZ)
+        kind := dow == dayofweek.sunday ? 2 : (dow >= dayofweek.monday and dow <= dayofweek.thursday) ? 1 : 0
+        if kind > 0
+            top := math.max(close[1], open)
+            bot := math.min(close[1], open)
+    float rng = top - bot
+    bool quarters = kind > 0 and rng >= quarterMin
+    [kind, top, bot, kind > 0 ? (top + bot) / 2 : na, quarters ? bot + rng * 0.25 : na, quarters ? bot + rng * 0.75 : na]
+
+// @function opening-range-gap.md VERIFIED. settle = close of the bar that closes exactly at 16:15 NY (the 16:14 1m bar;
+//   the 16:10 5m bar; the 16:00 15m bar); open = open of the bar starting 09:30. Fires on the 09:30 bar.
+//   dir = -1 premium gap (open > settle), +1 discount gap. band (sizes in points; pass ES-scaled values for ES):
+//   0 < minSize (ignore), 1 = min..bandMid (expect CE), 2 = bandMid..bandHigh (no edge), 3 >= bandHigh (nearest quadrant).
+//   DECISION: needs a TF <= 15m that divides 15 (30m/1H have no bar closing at 16:15 -> no ORG); a missing settle
+//   (early close) keeps the previous one. @returns [isNew, top, bottom, dir, band, settle, open930]
+export org(float minSize = 20.0, float bandMid = 75.0, float bandHigh = 120.0) =>
+    var float settle = na
+    bool isNew = false
+    float top = na
+    float bot = na
+    int dir = 0
+    int band = 0
+    if timeframe.isintraday and nyMin(time_close) == 16 * 60 + 15
+        settle := close
+    if startsAt(9, 30) and not na(settle)
+        isNew := true
+        top := math.max(settle, open)
+        bot := math.min(settle, open)
+        dir := open > settle ? -1 : open < settle ? 1 : 0
+        float sz = top - bot
+        band := sz < minSize ? 0 : sz < bandMid ? 1 : sz < bandHigh ? 2 : 3
+    [isNew, top, bot, dir, band, settle, isNew ? open : na]
+
+// @function opening-range-gap.md stat: true while the current bar is in [09:30, 10:00) NY and trades through ce.
+export orgCeTouch(float ce) =>
+    int t = nyMin(time)
+    t >= 9 * 60 + 30 and t < 10 * 60 and low <= ce and high >= ce

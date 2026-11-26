@@ -1,0 +1,648 @@
+//@version=6
+// ICT MMXM v2 (indicator) — liquidity rays, OC from relative-equal highs/lows, market-phase engine (Quarterly-Theory style
+// time grid + observed price behaviour), sequential SMT (SSMT) vs a correlated index, SMR signal with confluence score.
+// Ideas: kb/mmxm-spec.md, kb/concepts/{relative-equal-hl, smt, session-ranges, power-of-3}.md; quarter grid inspired by
+// Daye's Quarterly Theory (day 18:00-18:00 NY in four 6h quarters, each 6h session in four 90-min quarters, AMDX roles).
+indicator("ICT MMXM v2 (OC, rays, phases, SSMT)", "MMXM v2", overlay = false, max_lines_count = 500, max_boxes_count = 500, max_labels_count = 300, max_bars_back = 500)
+
+// ───────── Inputs
+gL = "Liquidity rays"
+swLen     = input.int(2, "Swing strength (bars each side)", minval = 1, group = gL)
+maxRays   = input.int(8, "Open rays per side", minval = 1, maxval = 40, group = gL)
+keepTaken = input.bool(true, "Keep swept levels (ray stops at the sweep)", group = gL)
+eqTolK    = input.float(0.25, "Relative-equal tolerance (x ATR14)", step = 0.05, group = gL)
+eqTolT    = input.int(4, "Tolerance floor (ticks)", minval = 0, group = gL)
+colB      = input.color(color.new(color.red, 20), "Buy-side liquidity", group = gL)
+colS      = input.color(color.new(color.teal, 20), "Sell-side liquidity", group = gL)
+
+gO = "Original consolidation (EQH / EQL cluster)"
+ocSrc     = input.string("Both", "OC source", options = ["EQ cluster", "Session window", "Both"], group = gO, tooltip = "Session window: the completed range of a consolidation window (Dawacadu examples: pre-session 07:00-09:30, Asia 20:00-00:00, premarket 04:30-07:30).")
+ocSess    = input.session("0700-0930", "OC session window (NY)", group = gO)
+ocMode    = input.string("EQH or EQL", "EQ cluster needs", options = ["EQH or EQL", "EQH and EQL"], group = gO)
+ocMinBars = input.int(5, "Min bars between the equal points", minval = 2, group = gO)
+ocMaxBars = input.int(150, "Max bars between the equal points", minval = 10, maxval = 400, group = gO)
+ocMaxK    = input.float(4.0, "Max OC height (x ATR14)", step = 0.5, group = gO)
+dispK     = input.float(1.0, "Departure candle body >= k x ATR14", step = 0.1, group = gO)
+
+gS = "SMR (after OC departure)"
+htf     = input.timeframe("240", "HTF range for premium / discount", group = gS)
+htfLook = input.int(20, "HTF range lookback (HTF bars)", minval = 5, group = gS)
+zoneOn  = input.bool(true, "Raid must be in HTF premium (sell) / discount (buy)", group = gS)
+smrWin  = input.int(20, "Raid -> confirmation window (bars)", minval = 3, group = gS)
+confMin = input.float(3.0, "Min confirmation score", step = 0.5, group = gS)
+smtSym  = input.symbol("CME_MINI:ES1!", "Correlated symbol (NQ chart: ES1!, ES chart: NQ1!)", group = gS)
+smrSess = input.session("0830-1000,1130-1230", "SMR time windows (NY)", group = gS)
+showStg = input.bool(true, "Label stages (Acc. before SMR, Dist. after SMR)", group = gS)
+
+gP = "Market phases (quarters)"
+cyc     = input.string("90 minutes", "Cycle for observed phases", options = ["90 minutes", "6-hour sessions"], group = gP)
+avgN    = input.int(20, "Range baseline (last N quarters)", minval = 5, group = gP)
+consK   = input.float(0.7, "Consolidation: range < k x baseline", step = 0.05, group = gP)
+expK    = input.float(1.3, "Expansion: range > k x baseline", step = 0.05, group = gP)
+showQ   = input.bool(false, "Draw quarter boundaries on the price chart", group = gP)
+showStrip = input.bool(true, "Show phase boxes (pane)", group = gP)
+showTbl = input.bool(true, "Show phase table", group = gP)
+
+// ───────── Common
+mt  = syminfo.mintick
+atr = ta.atr(14)
+tol = math.max(eqTolK * atr, eqTolT * mt)
+oHi = request.security(smtSym, timeframe.period, high, lookahead = barmerge.lookahead_off)
+oLo = request.security(smtSym, timeframe.period, low, lookahead = barmerge.lookahead_off)
+oHpiv = ta.highest(oHi, 2 * swLen + 1)
+oLpiv = ta.lowest(oLo, 2 * swLen + 1)
+oH3 = ta.highest(oHi, 3)
+oL3 = ta.lowest(oLo, 3)
+
+[hHi, hLo] = request.security(syminfo.tickerid, htf, [ta.highest(high, htfLook)[1], ta.lowest(low, htfLook)[1]], lookahead = barmerge.lookahead_on)
+eq = (hHi + hLo) / 2
+
+f_seriesOpen(bool up) =>
+    int s = 0
+    while s < 10 and (up ? close[s] <= open[s] : close[s] >= open[s])
+        s += 1
+    int e = s
+    while e < 30 and (up ? close[e + 1] > open[e + 1] : close[e + 1] < open[e + 1])
+        e += 1
+    open[e]
+
+f_amdx(int q) =>
+    q == 1 ? "A accumulation" : q == 2 ? "M manipulation" : q == 3 ? "D distribution" : "X continuation/reversal"
+
+// ───────── Time grid (New York): trading day 18:00 -> 18:00
+tz    = "America/New_York"
+nyMin = hour(time, tz) * 60 + minute(time, tz)
+sinceOpen = (nyMin - 18 * 60 + 1440) % 1440
+dayQ  = int(math.floor(sinceOpen / 360)) + 1
+q90   = int(math.floor((sinceOpen % 360) / 90)) + 1
+cycId = cyc == "90 minutes" ? int(math.floor(sinceOpen / 90)) : dayQ
+qIdx  = cyc == "90 minutes" ? q90 : dayQ
+newQ  = cycId != cycId[1] or timeframe.change("D")
+
+var float dayTO = na   // daily true open = 00:00 NY (start of daily Q2)
+if sinceOpen == 360 or (sinceOpen > 360 and sinceOpen[1] < 360)
+    dayTO := open
+
+// ───────── Quarter statistics, observed phase, SSMT
+var float qH = na
+var float qL = na
+var float qO = na
+var int   qHb = na
+var int   qLb = na
+var float oqH = na
+var float oqL = na
+var float pH = na
+var float pL = na
+var int   pHb = na
+var int   pLb = na
+var float poH = na
+var float poL = na
+var float[] rngs = array.new<float>()
+var string lastPhase = "-"
+var int    lastDir = 0
+var bool   ssBear = false
+var bool   ssBull = false
+
+if newQ
+    if not na(qH)
+        rng  = qH - qL
+        base = array.size(rngs) > 0 ? array.avg(rngs) : rng
+        sweptH = not na(pH) and qH > pH
+        sweptL = not na(pL) and qL < pL
+        qC  = close[1]
+        pos = rng > 0 ? (qC - qL) / rng : 0.5
+        prevPhase = lastPhase
+        prevDir = lastDir
+        string ph_ = "RETR"
+        int d = 0
+        if sweptH and sweptL
+            ph_ := "REV"
+            d := pos > 0.5 ? 1 : -1
+        else if rng < consK * base and not sweptH and not sweptL
+            ph_ := "CONS"
+        else if (sweptH and pos < 0.4) or (sweptL and pos > 0.6)
+            ph_ := "MANIP"
+            d := sweptH ? -1 : 1
+        else if rng > expK * base and ((sweptH and pos >= 0.7) or (sweptL and pos <= 0.3))
+            ph_ := "EXP"
+            d := sweptH ? 1 : -1
+        else if prevPhase == "EXP" and rng >= base and ((prevDir == 1 and pos <= 0.25) or (prevDir == -1 and pos >= 0.75))
+            ph_ := "REV"
+            d := -prevDir
+        else
+            d := qC > qO ? 1 : -1
+        lastPhase := ph_
+        lastDir := d
+        array.push(rngs, rng)
+        if array.size(rngs) > avgN
+            array.shift(rngs)
+        pH := qH
+        pL := qL
+        pHb := qHb
+        pLb := qLb
+        poH := oqH
+        poL := oqL
+    qH := high
+    qL := low
+    qO := open
+    qHb := bar_index
+    qLb := bar_index
+    oqH := oHi
+    oqL := oLo
+    ssBear := false
+    ssBull := false
+    if showQ
+        line.new(bar_index, low, bar_index, high, extend = extend.both, color = color.new(color.gray, qIdx == 1 ? 40 : 80), style = qIdx == 1 ? line.style_solid : line.style_dotted, force_overlay = true)
+else
+    if high > qH
+        qH := high
+        qHb := bar_index
+    if low < qL
+        qL := low
+        qLb := bar_index
+    oqH := math.max(oqH, oHi)
+    oqL := math.min(oqL, oLo)
+
+// SSMT: current quarter vs the previous completed quarter (one index takes the prior quarter extreme, the other does not)
+bearNow = not na(pH) and not na(poH) and ((qH > pH and oqH <= poH) or (qH <= pH and oqH > poH))
+bullNow = not na(pL) and not na(poL) and ((qL < pL and oqL >= poL) or (qL >= pL and oqL < poL))
+if bearNow and not ssBear
+    ssBear := true
+    line.new(pHb, pH, qHb, qH, color = color.orange, width = 2, force_overlay = true)
+    label.new(qHb, qH, "SSMT▼", color = color.new(color.orange, 100), textcolor = color.orange, style = label.style_label_down, size = size.small, force_overlay = true)
+if bullNow and not ssBull
+    ssBull := true
+    line.new(pLb, pL, qLb, qL, color = color.aqua, width = 2, force_overlay = true)
+    label.new(qLb, qL, "SSMT▲", color = color.new(color.aqua, 100), textcolor = color.aqua, style = label.style_label_up, size = size.small, force_overlay = true)
+
+// ───────── Liquidity rays (horizontal rays from each swing; stop at the sweep)
+ph = ta.pivothigh(high, swLen, swLen)
+pl = ta.pivotlow(low, swLen, swLen)
+var line[]  bL = array.new<line>()
+var float[] bP = array.new<float>()
+var int[]   bB = array.new<int>()
+var float[] bO = array.new<float>()
+var line[]  sL = array.new<line>()
+var float[] sP = array.new<float>()
+var int[]   sB = array.new<int>()
+var float[] sO = array.new<float>()
+var float lastSL = na
+var float lastSH = na
+
+// relative-equal registry: only the outermost live EQH (highest) and EQL (lowest) stay marked
+var float[] eqhP = array.new<float>()
+var label[] eqhLb = array.new<label>()
+var line[]  eqhA = array.new<line>()
+var line[]  eqhB = array.new<line>()
+var float[] eqlP = array.new<float>()
+var label[] eqlLb = array.new<label>()
+var line[]  eqlA = array.new<line>()
+var line[]  eqlB = array.new<line>()
+
+f_regEq(float[] ps, label[] lbs, line[] la, line[] lb, float p, label l, line a, line b) =>
+    array.push(ps, p)
+    array.push(lbs, l)
+    array.push(la, a)
+    array.push(lb, b)
+    if array.size(ps) > 20
+        array.shift(ps)
+        label.delete(array.shift(lbs))
+        array.shift(la)
+        array.shift(lb)
+
+// drop swept pools, then show only the extreme one
+f_showEq(float[] ps, label[] lbs, line[] la, line[] lb, bool isHigh, string txt) =>
+    int i = array.size(ps) - 1
+    while i >= 0
+        if isHigh ? high >= array.get(ps, i) + mt : low <= array.get(ps, i) - mt
+            label.delete(array.get(lbs, i))
+            array.remove(ps, i)
+            array.remove(lbs, i)
+            array.remove(la, i)
+            array.remove(lb, i)
+        i -= 1
+    int best = -1
+    for [j, p] in ps
+        if best < 0 or (isHigh ? p > array.get(ps, best) : p < array.get(ps, best))
+            best := j
+    for [j, p] in ps
+        on = j == best
+        label.set_text(array.get(lbs, j), on ? txt : "")
+        line.set_width(array.get(la, j), on ? 2 : 1)
+        line.set_width(array.get(lb, j), on ? 2 : 1)
+
+// OC candidate produced this bar
+float cHi = na
+float cLo = na
+int   cLeft = na
+bool  cEqh = false
+bool  cEql = false
+
+f_countNear(float[] ps, int[] bs, float level, int fromBar) =>
+    int n = 0
+    for [i, p] in ps
+        if math.abs(p - level) <= tol and array.get(bs, i) >= fromBar
+            n += 1
+    n
+
+if not na(ph)
+    pb = bar_index - swLen
+    lastSH := ph
+    int eqI = -1
+    for [i, p] in bP
+        gap = pb - array.get(bB, i)
+        if math.abs(p - ph) <= tol and gap >= ocMinBars and gap <= ocMaxBars
+            eqI := i
+    ln = line.new(pb, ph, pb + 1, ph, extend = extend.right, color = colB, width = 1, force_overlay = true)
+    if eqI >= 0
+        aB = array.get(bB, eqI)
+        f_regEq(eqhP, eqhLb, eqhA, eqhB, math.max(ph, array.get(bP, eqI)), label.new(pb, ph, "", color = color.new(colB, 100), textcolor = colB, style = label.style_label_down, size = size.tiny, force_overlay = true), ln, array.get(bL, eqI))
+        float lo_ = low[swLen]
+        for k = swLen to bar_index - aB
+            lo_ := math.min(lo_, low[k])
+        cHi := math.max(ph, array.get(bP, eqI))
+        cLo := lo_
+        cLeft := aB
+        cEqh := true
+        cEql := f_countNear(sP, sB, lo_, aB) >= 2
+    array.push(bL, ln)
+    array.push(bP, ph)
+    array.push(bB, pb)
+    array.push(bO, oHpiv)
+    if array.size(bP) > maxRays
+        line.delete(array.shift(bL))
+        array.shift(bP)
+        array.shift(bB)
+        array.shift(bO)
+
+if not na(pl)
+    pb = bar_index - swLen
+    lastSL := pl
+    int eqI = -1
+    for [i, p] in sP
+        gap = pb - array.get(sB, i)
+        if math.abs(p - pl) <= tol and gap >= ocMinBars and gap <= ocMaxBars
+            eqI := i
+    ln = line.new(pb, pl, pb + 1, pl, extend = extend.right, color = colS, width = 1, force_overlay = true)
+    if eqI >= 0
+        aB = array.get(sB, eqI)
+        f_regEq(eqlP, eqlLb, eqlA, eqlB, math.min(pl, array.get(sP, eqI)), label.new(pb, pl, "", color = color.new(colS, 100), textcolor = colS, style = label.style_label_up, size = size.tiny, force_overlay = true), ln, array.get(sL, eqI))
+        float hi_ = high[swLen]
+        for k = swLen to bar_index - aB
+            hi_ := math.max(hi_, high[k])
+        if na(cHi) or aB > cLeft
+            cHi := hi_
+            cLo := math.min(pl, array.get(sP, eqI))
+            cLeft := aB
+            cEql := true
+            cEqh := f_countNear(bP, bB, hi_, aB) >= 2
+    array.push(sL, ln)
+    array.push(sP, pl)
+    array.push(sB, pb)
+    array.push(sO, oLpiv)
+    if array.size(sP) > maxRays
+        line.delete(array.shift(sL))
+        array.shift(sP)
+        array.shift(sB)
+        array.shift(sO)
+
+// sweeps (trade-through by >= 1 tick): returns the most extreme level taken this bar
+f_sweep(line[] ls, float[] ps, int[] bs, float[] os, bool isHigh) =>
+    float best = na
+    float bestO = na
+    int i = array.size(ps) - 1
+    while i >= 0
+        p = array.get(ps, i)
+        if isHigh ? high >= p + mt : low <= p - mt
+            if na(best) or (isHigh ? p > best : p < best)
+                best := p
+                bestO := array.get(os, i)
+            l = array.get(ls, i)
+            if keepTaken
+                line.set_extend(l, extend.none)
+                line.set_x2(l, bar_index)
+                line.set_style(l, line.style_dotted)
+            else
+                line.delete(l)
+            array.remove(ls, i)
+            array.remove(ps, i)
+            array.remove(bs, i)
+            array.remove(os, i)
+        i -= 1
+    [best, bestO]
+
+[bslTaken, bslO] = f_sweep(bL, bP, bB, bO, true)
+[sslTaken, sslO] = f_sweep(sL, sP, sB, sO, false)
+f_showEq(eqhP, eqhLb, eqhA, eqhB, true, "EQH")
+f_showEq(eqlP, eqlLb, eqlA, eqlB, false, "EQL")
+
+// ───────── Original consolidation: latest valid EQH/EQL cluster, kept until price departs with displacement
+var float ocHi = na
+var float ocLo = na
+var int   ocLeft = na
+var bool  ocLive = false
+var box   ocBox = na
+inOcS = not na(time(timeframe.period, ocSess, tz))
+var float wH = na
+var float wL = na
+var int   wB = na
+if inOcS and not inOcS[1]
+    wH := high
+    wL := low
+    wB := bar_index
+else if inOcS
+    wH := math.max(wH, high)
+    wL := math.min(wL, low)
+sessEnd = not inOcS and inOcS[1] and not na(wB)
+
+okSides = ocMode == "EQH or EQL" ? (cEqh or cEql) : (cEqh and cEql)
+if sessEnd and ocSrc != "EQ cluster"
+    if ocLive
+        box.delete(ocBox)
+    ocHi := wH
+    ocLo := wL
+    ocLeft := wB
+    ocLive := true
+    nH = f_countNear(bP, bB, wH, wB)
+    nL = f_countNear(sP, sB, wL, wB)
+    tagS = "OC session" + (nH >= 2 ? " EQH" : "") + (nL >= 2 ? " EQL" : "")
+    ocBox := box.new(wB, wH, bar_index, wL, border_color = color.new(color.lime, 20), bgcolor = color.new(color.lime, 85), text = tagS, text_size = size.small, text_color = color.green, text_halign = text.align_left, text_valign = text.align_top, force_overlay = true)
+else if ocSrc != "Session window" and not na(cHi) and okSides and cHi - cLo > 0 and cHi - cLo <= ocMaxK * atr and (not ocLive or cLeft >= ocLeft)
+    if ocLive
+        box.delete(ocBox)
+    ocHi := cHi
+    ocLo := cLo
+    ocLeft := cLeft
+    ocLive := true
+    tag = "OC" + (cEqh and cEql ? " ★ EQH+EQL" : cEqh ? " EQH" : " EQL")
+    ocBox := box.new(ocLeft, ocHi, bar_index, ocLo, border_color = color.new(color.orange, 20), bgcolor = color.new(color.orange, 88), text = tag, text_size = size.small, text_color = color.orange, text_halign = text.align_left, text_valign = text.align_top, force_overlay = true)
+
+// model after departure: +1 = departed up (buy-side curve, sell model armed), -1 = departed down (buy model armed)
+var int   mDir = 0
+var float mHi = na
+var float mLo = na
+var int   mBar = na
+var int   accN = 0
+if ocLive
+    box.set_right(ocBox, bar_index)
+    upDep = close > ocHi and close - open >= dispK * atr
+    dnDep = close < ocLo and open - close >= dispK * atr
+    if upDep or dnDep
+        ocLive := false
+        mDir := upDep ? 1 : -1
+        mHi := ocHi
+        mLo := ocLo
+        mBar := bar_index
+        accN := 0
+        label.new(bar_index, upDep ? high : low, upDep ? "OC break ▲" : "OC break ▼", color = color.new(color.orange, 100), textcolor = color.orange, style = upDep ? label.style_label_down : label.style_label_up, size = size.tiny, force_overlay = true)
+    else if bar_index - ocLeft > 2 * ocMaxBars
+        ocLive := false
+
+// ───────── SMR: raid of liquidity beyond the OC (in HTF premium / discount) + confirmation score
+bullFvg = low > high[2]
+bearFvg = high < low[2]
+var float lbfBot = na
+var float lsfTop = na
+if bullFvg
+    lbfBot := high[2]
+if bearFvg
+    lsfTop := low[2]
+
+f_macro(t) =>
+    m = minute(t, tz)
+    m >= 50 or m < 10
+
+var int   rDir = 0      // 1 = watching a sell-model SMR, -1 = buy-model SMR
+var float rExt = na
+var int   rBar = na
+var float rCisd = na
+var float rMss = na
+var float rIfvg = na
+var bool  rMac = false
+var bool  rPt = false
+var bool  rTw = false
+
+if mDir == 1 and rDir == 0 and not na(bslTaken) and bslTaken > mHi and (not zoneOn or high > eq)
+    rDir := 1
+    rExt := high
+    rBar := bar_index
+    rCisd := f_seriesOpen(true)
+    rMss := lastSL
+    rIfvg := lbfBot
+    rMac := f_macro(time)
+    rPt := not na(bslO) and oH3 < bslO
+    rTw := not na(time(timeframe.period, smrSess, tz))
+if mDir == -1 and rDir == 0 and not na(sslTaken) and sslTaken < mLo and (not zoneOn or low < eq)
+    rDir := -1
+    rExt := low
+    rBar := bar_index
+    rCisd := f_seriesOpen(false)
+    rMss := lastSH
+    rIfvg := lsfTop
+    rMac := f_macro(time)
+    rPt := not na(sslO) and oL3 > sslO
+    rTw := not na(time(timeframe.period, smrSess, tz))
+
+var bool fC = false
+var bool fM = false
+var bool fI = false
+var int   postDir = 0
+var int   postBar = na
+var float postTgt = na
+var int   distN = 0
+var float prevSw = na
+var float prevSwO = na
+if rDir != 0
+    if bar_index == rBar
+        fC := false
+        fM := false
+        fI := false
+    if rDir == 1 and high > rExt
+        rExt := high
+        rCisd := f_seriesOpen(true)
+        fC := false
+        fM := false
+        fI := false
+    if rDir == -1 and low < rExt
+        rExt := low
+        rCisd := f_seriesOpen(false)
+        fC := false
+        fM := false
+        fI := false
+    fC := fC or (rDir == 1 ? low <= rCisd - mt : high >= rCisd + mt)
+    fM := fM or (not na(rMss) and (rDir == 1 ? low <= rMss - mt : high >= rMss + mt))
+    fI := fI or (not na(rIfvg) and (rDir == 1 ? close < rIfvg : close > rIfvg))
+    ss = rDir == 1 ? ssBear : ssBull
+    hq = rDir == 1 ? rExt >= hLo + 0.75 * (hHi - hLo) : rExt <= hLo + 0.25 * (hHi - hLo)
+    score = (fC ? 2.0 : 0) + (fI ? 2.0 : 0) + (fM ? 1.5 : 0) + (ss ? 1.5 : 0) + (rPt ? 1.5 : 0) + (hq ? 1.0 : 0) + (rMac ? 0.5 : 0) + (rTw ? 0.5 : 0)
+    if score >= confMin
+        comp = (fC ? "C" : "") + (fI ? "I" : "") + (fM ? "M" : "") + (ss ? "S" : "") + (rPt ? "P" : "") + (hq ? "H" : "") + (rMac ? "m" : "") + (rTw ? "T" : "")
+        col = rDir == 1 ? color.maroon : color.teal
+        label.new(bar_index, rExt, (rDir == 1 ? "SMR ▼ " : "SMR ▲ ") + str.tostring(score, "#.0") + " " + comp, color = color.new(col, 100), textcolor = col, style = rDir == 1 ? label.style_label_down : label.style_label_up, size = size.small, force_overlay = true)
+        tgt = rDir == 1 ? mLo : mHi
+        line.new(bar_index, tgt, bar_index + 30, tgt, color = col, style = line.style_dashed, width = 2, force_overlay = true)
+        label.new(bar_index + 30, tgt, "draw: OC " + (rDir == 1 ? "low" : "high"), color = color.new(col, 100), textcolor = col, style = label.style_label_left, size = size.tiny, force_overlay = true)
+        postDir := rDir == 1 ? -1 : 1
+        postBar := bar_index
+        postTgt := tgt
+        distN := 0
+        prevSw := na
+        prevSwO := na
+        rDir := 0
+        mDir := 0
+    else if bar_index - rBar > smrWin
+        rDir := 0
+
+// ───────── Phase boxes (pane): row 1 = 90-min quarters, row 2 = 6-hour quarters of the 18:00 NY day
+// ───────── Stage labels (Dawacadu naming): pullbacks on the curve before the SMR = Acc. n, after the SMR = Dist. n;
+// a Dist. swing that diverges from the correlated index vs the previous Dist. swing = stage divergence (second entry)
+if showStg and mDir != 0
+    if mDir == 1 and not na(pl) and bar_index - swLen > mBar and pl > mHi
+        accN += 1
+        label.new(bar_index - swLen, pl, "Acc. " + str.tostring(accN), color = color.new(color.gray, 100), textcolor = color.gray, style = label.style_label_up, size = size.tiny, force_overlay = true)
+    if mDir == -1 and not na(ph) and bar_index - swLen > mBar and ph < mLo
+        accN += 1
+        label.new(bar_index - swLen, ph, "Acc. " + str.tostring(accN), color = color.new(color.gray, 100), textcolor = color.gray, style = label.style_label_down, size = size.tiny, force_overlay = true)
+if postDir != 0
+    float sw = postDir == 1 ? pl : ph
+    float swO = postDir == 1 ? oLpiv : oHpiv
+    if showStg and not na(sw) and bar_index - swLen > postBar
+        distN += 1
+        div = not na(prevSw) and (postDir == 1 ? ((sw < prevSw and swO >= prevSwO) or (sw >= prevSw and swO < prevSwO)) : ((sw > prevSw and swO <= prevSwO) or (sw <= prevSw and swO > prevSwO)))
+        col2 = div ? color.fuchsia : color.gray
+        label.new(bar_index - swLen, sw, "Dist. " + str.tostring(distN) + (div ? " · SMT" : ""), color = color.new(col2, 100), textcolor = col2, style = postDir == 1 ? label.style_label_up : label.style_label_down, size = size.tiny, force_overlay = true)
+        prevSw := sw
+        prevSwO := swO
+    if (postDir == 1 and high >= postTgt) or (postDir == -1 and low <= postTgt) or distN > 4 or bar_index - postBar > 400
+        postDir := 0
+
+f_classify(float h_, float l_, float c_, float o_, float ph_, float pl_, float base, string prevP, int prevD) =>
+    rng = h_ - l_
+    sH = not na(ph_) and h_ > ph_
+    sLw = not na(pl_) and l_ < pl_
+    pos = rng > 0 ? (c_ - l_) / rng : 0.5
+    string r = "RETR"
+    int d = c_ > o_ ? 1 : -1
+    if sH and sLw
+        r := "REV"
+        d := pos > 0.5 ? 1 : -1
+    else if rng < consK * base and not sH and not sLw
+        r := "CONS"
+        d := 0
+    else if (sH and pos < 0.4) or (sLw and pos > 0.6)
+        r := "MANIP"
+        d := sH ? -1 : 1
+    else if rng > expK * base and ((sH and pos >= 0.7) or (sLw and pos <= 0.3))
+        r := "EXP"
+        d := sH ? 1 : -1
+    else if prevP == "EXP" and rng >= base and ((prevD == 1 and pos <= 0.25) or (prevD == -1 and pos >= 0.75))
+        r := "REV"
+        d := -prevD
+    [r, d]
+
+f_pcol(string p) =>
+    p == "CONS" ? color.new(color.gray, 55) : p == "MANIP" ? color.new(color.red, 65) : p == "EXP" ? color.new(color.green, 60) : p == "REV" ? color.new(color.purple, 60) : p == "RETR" ? color.new(color.blue, 70) : color.new(color.silver, 80)
+
+f_letter(int q) =>
+    q == 1 ? "A" : q == 2 ? "M" : q == 3 ? "D" : "X"
+
+id90 = int(math.floor(sinceOpen / 90))
+new90 = id90 != id90[1] or timeframe.change("D")
+new6  = dayQ != dayQ[1] or timeframe.change("D")
+
+var box   b90 = na
+var int   k90 = na
+var float h90 = na
+var float l90 = na
+var float o90 = na
+var float ph90 = na
+var float pl90 = na
+var float[] r90 = array.new<float>()
+var string lp90 = "-"
+var int   ld90 = 0
+var box   b6 = na
+var int   k6 = na
+var float h6 = na
+var float l6 = na
+var float o6 = na
+var float ph6 = na
+var float pl6 = na
+var float[] r6 = array.new<float>()
+var string lp6 = "-"
+var int   ld6 = 0
+
+if showStrip
+    if new90
+        if not na(b90)
+            base = array.size(r90) > 0 ? array.avg(r90) : h90 - l90
+            [p_, d_] = f_classify(h90, l90, close[1], o90, ph90, pl90, base, lp90, ld90)
+            box.set_bgcolor(b90, f_pcol(p_))
+            box.set_text(b90, "Q" + str.tostring(k90) + " " + f_letter(k90) + " | " + p_ + (d_ == 1 ? " ▲" : d_ == -1 ? " ▼" : ""))
+            lp90 := p_
+            ld90 := d_
+            array.push(r90, h90 - l90)
+            if array.size(r90) > avgN
+                array.shift(r90)
+            ph90 := h90
+            pl90 := l90
+        k90 := q90
+        b90 := box.new(bar_index, 2.0, bar_index, 1.05, border_color = color.new(color.gray, 30), bgcolor = color.new(color.silver, 85), text = "Q" + str.tostring(q90) + " " + f_letter(q90) + " …", text_size = size.auto, text_color = color.white)
+        h90 := high
+        l90 := low
+        o90 := open
+    else
+        h90 := math.max(h90, high)
+        l90 := math.min(l90, low)
+        box.set_right(b90, bar_index)
+    if new6
+        if not na(b6)
+            base6 = array.size(r6) > 0 ? array.avg(r6) : h6 - l6
+            [p6_, d6_] = f_classify(h6, l6, close[1], o6, ph6, pl6, base6, lp6, ld6)
+            box.set_bgcolor(b6, f_pcol(p6_))
+            box.set_text(b6, "Q" + str.tostring(k6) + " " + f_letter(k6) + " | " + p6_ + (d6_ == 1 ? " ▲" : d6_ == -1 ? " ▼" : ""))
+            lp6 := p6_
+            ld6 := d6_
+            array.push(r6, h6 - l6)
+            if array.size(r6) > avgN
+                array.shift(r6)
+            ph6 := h6
+            pl6 := l6
+        k6 := dayQ
+        b6 := box.new(bar_index, 0.95, bar_index, 0.0, border_color = color.new(color.gray, 30), bgcolor = color.new(color.silver, 85), text = "Q" + str.tostring(dayQ) + " " + f_letter(dayQ) + " …", text_size = size.auto, text_color = color.white)
+        h6 := high
+        l6 := low
+        o6 := open
+    else
+        h6 := math.max(h6, high)
+        l6 := math.min(l6, low)
+        box.set_right(b6, bar_index)
+
+plot(2.0, "pane top", color = na, editable = false)
+plot(0.0, "pane bottom", color = na, editable = false)
+
+// ───────── Phase table
+f_expect(string p, int d) =>
+    p == "CONS" ? "Manipulation (Judas) then expansion" : p == "MANIP" ? "Distribution " + (d == 1 ? "UP" : "DOWN") : p == "EXP" ? "Continuation or reversal (X); retracement into the expansion's FVG" : p == "REV" ? "New leg " + (d == 1 ? "UP" : "DOWN") + "; watch first retracement" : "Continuation of the prior expansion"
+
+var table tbl = table.new(position.bottom_right, 2, 8, bgcolor = color.new(color.black, 15), border_width = 1, force_overlay = true)
+if barstate.islast and showTbl
+    nextQ = qIdx % 4 + 1
+    table.cell(tbl, 0, 0, "Phase engine", text_color = color.white)
+    table.cell(tbl, 1, 0, cyc, text_color = color.gray)
+    table.cell(tbl, 0, 1, "Daily cycle", text_color = color.white)
+    table.cell(tbl, 1, 1, "Q" + str.tostring(dayQ) + "  " + f_amdx(dayQ), text_color = color.yellow)
+    table.cell(tbl, 0, 2, "90-min cycle", text_color = color.white)
+    table.cell(tbl, 1, 2, "Q" + str.tostring(q90) + "  " + f_amdx(q90), text_color = color.yellow)
+    table.cell(tbl, 0, 3, "Last quarter (observed)", text_color = color.white)
+    table.cell(tbl, 1, 3, lastPhase + (lastDir == 1 ? " ▲" : lastDir == -1 ? " ▼" : ""), text_color = lastDir == 1 ? color.lime : lastDir == -1 ? color.red : color.white)
+    table.cell(tbl, 0, 4, "Next by clock", text_color = color.white)
+    table.cell(tbl, 1, 4, "Q" + str.tostring(nextQ) + "  " + f_amdx(nextQ), text_color = color.white)
+    table.cell(tbl, 0, 5, "Next by price", text_color = color.white)
+    table.cell(tbl, 1, 5, f_expect(lastPhase, lastDir), text_color = color.white)
+    table.cell(tbl, 0, 6, "SSMT this quarter", text_color = color.white)
+    table.cell(tbl, 1, 6, ssBear and ssBull ? "both" : ssBear ? "bearish ▼" : ssBull ? "bullish ▲" : "none", text_color = ssBear ? color.orange : ssBull ? color.aqua : color.gray)
+    table.cell(tbl, 0, 7, "Day true open (00:00)", text_color = color.white)
+    table.cell(tbl, 1, 7, na(dayTO) ? "-" : str.tostring(dayTO, format.mintick) + (close > dayTO ? "  price above (premium)" : "  price below (discount)"), text_color = color.white)
+
+plot(eq, "HTF EQ", color.new(color.gray, 50), 1, plot.style_stepline, force_overlay = true)
+plot(dayTO, "Day true open", color.new(color.yellow, 40), 1, plot.style_linebr, force_overlay = true)

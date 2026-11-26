@@ -1,0 +1,11 @@
+# Raw/cleaned ICT subtitles: user-downloaded, local only (copyright) - never publish
+transcripts/
+# Local scratch, backups, snapshots
+_work/
+# Market data exports (large, broker/vendor terms)
+data/
+research/data/
+*.tgz
+__pycache__/
+.DS_Store
+Thumbs.db

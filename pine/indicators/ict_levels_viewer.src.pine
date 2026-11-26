@@ -1,0 +1,392 @@
+//@version=6
+// ICT Levels Viewer (phase 1) - draws the ict_core / ict_time detectors for eyeballing. SOURCE file: it imports the
+// libraries. TradingView only imports PUBLISHED libraries and this project never publishes, so the script that is
+// saved to TradingView is the bundled ict_levels_viewer.pine built by scripts/build_pine.py (libraries inlined).
+// "P:" plots are data-window-only probe values latched on the date `Probe date` (used for MCP eyeball checks).
+indicator("ICT Levels Viewer", "ICT Lv", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 300, max_bars_back = 500)
+import YOUR_TV_USER/ict_core/1 as ictc
+import YOUR_TV_USER/ict_time/1 as ictt
+
+// ---------------------------------------------------------------- inputs
+GL = "Levels"
+GC = "Context"
+GT = "Time"
+GP = "Probe"
+float TICK  = syminfo.mintick
+bool  isES  = syminfo.root == "ES" or syminfo.root == "MES"
+float scale = isES ? 0.25 : 1.0     // NQ-to-ES size scaling (key-levels conventions)
+float tickS = isES ? 0.5 : 1.0      // tick defaults NQ 4 / ES 2
+
+iSwing   = input.bool(true, "Swing points (3-bar)", group = GL)
+iSwBody  = input.bool(false, "Swing price = body extreme", group = GL)
+iEq      = input.bool(true, "Relative equal H/L", group = GL)
+iEqTol   = input.int(4, "EQ tolerance ticks (NQ; ES x0.5)", 0, 12, group = GL)
+iFvg     = input.bool(true, "FVG", group = GL)
+iFvgMin  = input.int(4, "FVG min ticks (NQ; ES x0.5)", 1, 40, group = GL)
+iFvgVI   = input.bool(true, "FVG box incl. adjacent VI", group = GL)
+iIfvg    = input.bool(true, "IFVG", group = GL)
+iVi      = input.bool(false, "Volume imbalance", group = GL)
+iViMin   = input.int(1, "VI min ticks", 1, 8, group = GL)
+iOb      = input.bool(true, "Order blocks", group = GL)
+iObRun   = input.int(5, "OB / breaker max run", 1, 10, group = GL)
+iBrk     = input.bool(true, "Breakers (U = unicorn)", group = GL)
+iBrkCl   = input.bool(false, "Breaker trigger = body close", group = GL)
+iCisd    = input.bool(true, "CISD", group = GL)
+iCisdCl  = input.bool(false, "CISD trigger = body close", group = GL)
+iCisdMax = input.int(30, "CISD max bars", 5, 120, group = GL)
+iMss     = input.bool(true, "MSS", group = GL)
+iMssCl   = input.bool(false, "MSS trigger = body close", group = GL)
+iMssDisp = input.bool(true, "MSS needs displacement", group = GL)
+iMssMax  = input.int(20, "MSS max bars", 5, 60, group = GL)
+iWick    = input.bool(false, "Wick CE (prominent wicks)", group = GL)
+iWickAtr = input.float(0.5, "Wick min x ATR", 0.2, 1.5, group = GL)
+iDisp    = input.bool(false, "Mark displacement bars", group = GC)
+iDBody   = input.float(1.0, "Displacement body x ATR", 0.6, 2.0, group = GC)
+iDPos    = input.float(0.7, "Displacement close position", 0.5, 0.9, group = GC)
+iMaxZ    = input.int(20, "Max zones kept per type", 5, 100, group = GC)
+iGaps    = input.bool(true, "NDOG / NWOG", group = GT)
+iGapKeep = input.int(5, "Opening gaps kept", 1, 12, group = GT)
+iOrg     = input.bool(true, "Opening range gap (16:14 -> 09:30) + quadrants", group = GT)
+iOrgMin  = input.float(20, "ORG min handles (NQ; ES x0.25)", group = GT)
+iOrgMid  = input.float(75, "ORG band edge 1", group = GT)
+iOrgHigh = input.float(120, "ORG band edge 2", group = GT)
+iOrgKeep = input.int(5, "ORGs kept", 1, 5, group = GT)
+iAsia    = input.bool(true, "Asia range", group = GT)
+sAsia    = input.session("1800-0000", "Asia window", group = GT)
+iLon     = input.bool(true, "London killzone", group = GT)
+sLon     = input.session("0200-0500", "London window", group = GT)
+iNy      = input.bool(true, "NY AM killzone", group = GT)
+sNy      = input.session("0700-1000", "NY AM window", group = GT)
+iLunch   = input.bool(false, "Lunch", group = GT)
+sLunch   = input.session("1130-1330", "Lunch window", group = GT)
+iPm      = input.bool(false, "NY PM", group = GT)
+sPm      = input.session("1330-1600", "NY PM window", group = GT)
+iPd      = input.bool(true, "Previous day H/L", group = GT)
+iOpens   = input.bool(true, "Opens 00:00 / 08:30 / 09:30", group = GT)
+iMacro   = input.bool(true, "Macro background (xx:50-xx:10, 15:15-16:00)", group = GT)
+iProbe   = input.int(20260708, "Probe date yyyymmdd (NY)", group = GP)
+
+// ---------------------------------------------------------------- drawing helpers
+addZone(array<ictc.Zone> zs, array<box> bs, ictc.Zone z, color c, int maxN, string txt) =>
+    box b = box.new(z.t_created, z.top, time, z.bottom, xloc = xloc.bar_time, bgcolor = c, border_color = color.new(c, 40), text = txt, text_size = size.tiny, text_halign = text.align_left, text_color = color.gray)
+    zs.push(z)
+    bs.push(b)
+    if zs.size() > maxN
+        zs.shift()
+        box.delete(bs.shift())
+
+extendZones(array<ictc.Zone> zs, array<box> bs) =>
+    if zs.size() > 0
+        for i = 0 to zs.size() - 1
+            ictc.Zone z = zs.get(i)
+            box b = bs.get(i)
+            if not z.mitigated
+                b.set_right(time)
+            else if not na(z.t_end)
+                b.set_right(z.t_end)
+                b.set_bgcolor(color.new(color.gray, 90))
+
+addLine(array<line> ls, int t1, float p, color c, string txt, int maxN) =>
+    line l = line.new(t1, p, time, p, xloc = xloc.bar_time, color = c, width = 1)
+    label.new(time, p, txt, xloc = xloc.bar_time, style = label.style_none, textcolor = c, size = size.tiny)
+    ls.push(l)
+    if ls.size() > maxN
+        line.delete(ls.shift())
+
+// ---------------------------------------------------------------- detectors (called every bar)
+[sh, shP, shT, shI] = ictc.swingHigh(1, iSwBody)
+[sl, slP, slT, slI] = ictc.swingLow(1, iSwBody)
+int dBar = ictc.displacementBar(iDBody, iDPos, 14)
+ictc.Zone fz = ictc.fvg(iFvgMin * tickS * TICK, iFvgVI, dBar[1] != 0)
+bool fB = not na(fz) and fz.dir == 1
+bool fS = not na(fz) and fz.dir == -1
+[obBear, obBull] = ictc.orderBlock(iObRun)
+[brBear, brBull] = ictc.breaker(sh, shP, shI, sl, slP, slI, 0.0, iBrkCl, iObRun, 450)
+[cBf, cBl, cBt, cUf, cUl, cUt] = ictc.cisd(sh, sl, 10, iCisdMax, iCisdCl)
+[mBf, mBr, mUf, mUr] = ictc.mss(sh, shP, sl, slP, dBar, false, false, iMssMax, iMssCl, iMssDisp)
+float eqTol = iEqTol * tickS * TICK
+ictc.Zone eqH = ictc.eqPool(sh, shP, shT, true, eqTol, true, 10)
+ictc.Zone eqL = ictc.eqPool(sl, slP, slT, false, eqTol, true, 10)
+ictc.Zone vz = ictc.volumeImbalance(iViMin * TICK)
+ictc.Zone wU = ictc.wickZone(true, 0, iWickAtr)
+ictc.Zone wL = ictc.wickZone(false, 0, iWickAtr)
+
+[gk, gTop, gBot, gCe, gQ25, gQ75] = ictt.openingGap(80 * TICK * scale)
+[orgNew, oTop, oBot, oDir, oBand, oSettle, oOpen] = ictt.org(iOrgMin * scale, iOrgMid * scale, iOrgHigh * scale)
+[aH, aL, aO, aIn, aSt, aEn] = ictt.sessionRange(sAsia)
+[lH, lL, lO, lIn, lSt, lEn] = ictt.sessionRange(sLon)
+[nH, nL, nO, nIn, nSt, nEn] = ictt.sessionRange(sNy)
+[uH, uL, uO, uIn, uSt, uEn] = ictt.sessionRange(sLunch)
+[pH, pL, pO, pIn, pSt, pEn] = ictt.sessionRange(sPm)
+[pdh, pdl, newDay] = ictt.prevDayHL()
+[o00, o00New] = ictt.openAt(0, 0)
+[o830, o830New] = ictt.openAt(8, 30)
+[o930, o930New] = ictt.openAt(9, 30)
+[inMac, inMacX] = ictt.macro(0)
+
+// ---------------------------------------------------------------- zone bookkeeping + drawing
+var array<ictc.Zone> fvgs = array.new<ictc.Zone>()
+var array<box>       fvgB = array.new<box>()
+var array<ictc.Zone> ifvs = array.new<ictc.Zone>()
+var array<box>       ifvB = array.new<box>()
+var array<ictc.Zone> vis  = array.new<ictc.Zone>()
+var array<box>       viB  = array.new<box>()
+var array<ictc.Zone> obs  = array.new<ictc.Zone>()
+var array<box>       obB  = array.new<box>()
+var array<ictc.Zone> brks = array.new<ictc.Zone>()
+var array<box>       brB  = array.new<box>()
+var array<ictc.Zone> wks  = array.new<ictc.Zone>()
+var array<box>       wkB  = array.new<box>()
+var array<ictc.Zone> eqs  = array.new<ictc.Zone>()
+var array<box>       eqB  = array.new<box>()
+var array<ictc.Zone> gaps = array.new<ictc.Zone>()
+var array<box>       gapB = array.new<box>()
+var array<line>      evL  = array.new<line>()
+var array<line>      orgL = array.new<line>()
+int nIfvgNew = 0
+
+// updates first (zones created on this bar are added afterwards)
+if fvgs.size() > 0
+    for i = 0 to fvgs.size() - 1
+        ictc.Zone z = fvgs.get(i)
+        if ictc.fvgUpdate(z) == 1 and iIfvg
+            ictc.Zone iz = ictc.ifvgFrom(z)
+            addZone(ifvs, ifvB, iz, color.new(iz.dir == 1 ? color.teal : color.maroon, 75), iMaxZ, "IFVG")
+            nIfvgNew += 1
+if ifvs.size() > 0
+    for z in ifvs
+        ictc.ifvgUpdate(z)
+if vis.size() > 0
+    for z in vis
+        ictc.viUpdate(z)
+if obs.size() > 0
+    for z in obs
+        ictc.blockUpdate(z)
+if brks.size() > 0
+    for z in brks
+        ictc.blockUpdate(z)
+if wks.size() > 0
+    for z in wks
+        ictc.wickUpdate(z)
+if eqs.size() > 0
+    for z in eqs
+        if not z.mitigated and (z.dir == 1 ? high > z.key : low < z.key)
+            z.mitigated := true
+            z.t_end := time
+
+if iFvg and not na(fz)
+    addZone(fvgs, fvgB, fz, color.new(fz.dir == 1 ? color.green : color.red, 80), iMaxZ, fz.dir == 1 ? "BISI" : "SIBI")
+if iVi and not na(vz)
+    addZone(vis, viB, vz, color.new(color.yellow, 80), iMaxZ, "VI")
+if iOb and not na(obBear)
+    addZone(obs, obB, obBear, color.new(color.orange, 75), iMaxZ, "-OB")
+if iOb and not na(obBull)
+    addZone(obs, obB, obBull, color.new(color.blue, 75), iMaxZ, "+OB")
+bool uniBear = false
+bool uniBull = false
+if fvgs.size() > 0
+    for z in fvgs
+        if not z.mitigated
+            uniBear := uniBear or (z.dir == -1 and ictc.overlaps(brBear, z))
+            uniBull := uniBull or (z.dir == 1 and ictc.overlaps(brBull, z))
+if iBrk and not na(brBear)
+    addZone(brks, brB, brBear, color.new(color.fuchsia, 75), iMaxZ, uniBear ? "-BRK U" : "-BRK")
+if iBrk and not na(brBull)
+    addZone(brks, brB, brBull, color.new(color.aqua, 75), iMaxZ, uniBull ? "+BRK U" : "+BRK")
+if iWick and not na(wU)
+    addZone(wks, wkB, wU, color.new(color.silver, 80), iMaxZ, "wick")
+if iWick and not na(wL)
+    addZone(wks, wkB, wL, color.new(color.silver, 80), iMaxZ, "wick")
+if iEq and not na(eqH)
+    addZone(eqs, eqB, eqH, color.new(color.red, 0), iMaxZ, eqH.flag ? "EQH smooth" : "EQH")
+if iEq and not na(eqL)
+    addZone(eqs, eqB, eqL, color.new(color.green, 0), iMaxZ, eqL.flag ? "EQL smooth" : "EQL")
+if iGaps and gk > 0
+    ictc.Zone g = ictc.newZone(gTop, gBot, 0, gk == 2 ? "NWOG" : "NDOG", time)
+    addZone(gaps, gapB, g, color.new(gk == 2 ? color.purple : color.gray, 80), iGapKeep, g.kind + " CE " + str.tostring(gCe, format.mintick))
+if iCisd and cBf
+    addLine(evL, cBt, cBl, color.red, "CISD-", iMaxZ)
+if iCisd and cUf
+    addLine(evL, cUt, cUl, color.green, "CISD+", iMaxZ)
+if iMss and mBf
+    addLine(evL, time[1], mBr, color.maroon, "MSS-", iMaxZ)
+if iMss and mUf
+    addLine(evL, time[1], mUr, color.teal, "MSS+", iMaxZ)
+if iOrg and orgNew
+    int tEnd = time + 390 * 60000
+    color oc = oDir == -1 ? color.red : color.green
+    array<float> lv = ictc.grid(oBot, oTop, 4)
+    for k = 0 to 4
+        orgL.push(line.new(time, lv.get(k), tEnd, lv.get(k), xloc = xloc.bar_time, color = color.new(oc, k == 2 ? 0 : 50), style = k == 2 ? line.style_solid : line.style_dotted))
+    label.new(time, oTop, "ORG " + (oDir == -1 ? "prem" : "disc") + " band " + str.tostring(oBand), xloc = xloc.bar_time, style = label.style_none, textcolor = oc, size = size.tiny)
+    while orgL.size() > 5 * iOrgKeep
+        line.delete(orgL.shift())
+
+extendZones(fvgs, fvgB)
+extendZones(ifvs, ifvB)
+extendZones(vis, viB)
+extendZones(obs, obB)
+extendZones(brks, brB)
+extendZones(wks, wkB)
+extendZones(eqs, eqB)
+extendZones(gaps, gapB)
+
+plotshape(iSwing and sh, "STH", shape.triangledown, location.abovebar, color.red, offset = -1, size = size.tiny)
+plotshape(iSwing and sl, "STL", shape.triangleup, location.belowbar, color.green, offset = -1, size = size.tiny)
+plotshape(iDisp and dBar != 0, "Disp", shape.circle, location.bottom, dBar == 1 ? color.green : color.red, size = size.tiny)
+plot(iAsia ? aH : na, "Asia H", color.new(color.orange, 30), style = plot.style_linebr)
+plot(iAsia ? aL : na, "Asia L", color.new(color.orange, 30), style = plot.style_linebr)
+plot(iLon ? lH : na, "London H", color.new(color.blue, 30), style = plot.style_linebr)
+plot(iLon ? lL : na, "London L", color.new(color.blue, 30), style = plot.style_linebr)
+plot(iNy ? nH : na, "NY AM H", color.new(color.purple, 30), style = plot.style_linebr)
+plot(iNy ? nL : na, "NY AM L", color.new(color.purple, 30), style = plot.style_linebr)
+plot(iLunch ? uH : na, "Lunch H", color.new(color.gray, 30), style = plot.style_linebr)
+plot(iLunch ? uL : na, "Lunch L", color.new(color.gray, 30), style = plot.style_linebr)
+plot(iPm ? pH : na, "PM H", color.new(color.olive, 30), style = plot.style_linebr)
+plot(iPm ? pL : na, "PM L", color.new(color.olive, 30), style = plot.style_linebr)
+plot(iPd ? pdh : na, "PDH", color.new(color.red, 0), style = plot.style_stepline)
+plot(iPd ? pdl : na, "PDL", color.new(color.green, 0), style = plot.style_stepline)
+plot(iOpens ? o00 : na, "Midnight open", color.new(color.black, 0), style = plot.style_stepline)
+plot(iOpens ? o830 : na, "08:30 open", color.new(color.gray, 0), style = plot.style_stepline)
+plot(iOpens ? o930 : na, "09:30 open", color.new(color.navy, 0), style = plot.style_stepline)
+bgcolor(iMacro and (inMac or inMacX) and timeframe.isintraday and timeframe.multiplier <= 15 ? color.new(color.purple, 93) : na, title = "Macro")
+
+// ---------------------------------------------------------------- probe (data window only)
+DW = display.data_window
+bool pd = ictt.nyDate(time) == iProbe
+bool pdFirst = pd and not pd[1]
+bool rth = ictt.nyMin(time) >= 570
+var float lastGapTop = na
+var float lastGapBot = na
+var int   lastGapKind = 0
+if gk > 0
+    lastGapTop := gTop
+    lastGapBot := gBot
+    lastGapKind := gk
+var float pMid = na
+var float p830 = na
+var float p930 = na
+var float pOrgSet = na
+var float pOrgOpen = na
+var float pOrgBand = na
+var float pGapTop = na
+var float pGapBot = na
+var float pGapKind = na
+var float pAsiaH = na
+var float pAsiaL = na
+var float pLonH = na
+var float pLonL = na
+var float pPdh = na
+var float pPdl = na
+var float nFvgB = 0
+var float nFvgS = 0
+var float nIfvg = 0
+var float nObS = 0
+var float nObB = 0
+var float nBrk = 0
+var float nCisd = 0
+var float nMss = 0
+var float nEq = 0
+var float nSw = 0
+var float fFvgTop = na
+var float fFvgBot = na
+var float fFvgDir = na
+var float fFvgT = na
+var float fCisdLvl = na
+var float fCisdDir = na
+var float fCisdT = na
+var float fMssRef = na
+var float fMssDir = na
+var float fMssT = na
+var float fObKey = na
+var float fObDir = na
+var float fObT = na
+if pd
+    if o00New
+        pMid := o00
+    if o830New
+        p830 := o830
+    if o930New
+        p930 := o930
+    if orgNew
+        pOrgSet := oSettle
+        pOrgOpen := oOpen
+        pOrgBand := oBand
+    if pdFirst
+        pGapTop := lastGapTop
+        pGapBot := lastGapBot
+        pGapKind := lastGapKind
+        pPdh := pdh
+        pPdl := pdl
+    if aEn
+        pAsiaH := aH
+        pAsiaL := aL
+    if lEn
+        pLonH := lH
+        pLonL := lL
+    nFvgB += fB ? 1 : 0
+    nFvgS += fS ? 1 : 0
+    nIfvg += nIfvgNew
+    nObS += na(obBear) ? 0 : 1
+    nObB += na(obBull) ? 0 : 1
+    nBrk += (na(brBear) ? 0 : 1) + (na(brBull) ? 0 : 1)
+    nCisd += (cBf ? 1 : 0) + (cUf ? 1 : 0)
+    nMss += (mBf ? 1 : 0) + (mUf ? 1 : 0)
+    nEq += (na(eqH) ? 0 : 1) + (na(eqL) ? 0 : 1)
+    nSw += (sh ? 1 : 0) + (sl ? 1 : 0)
+    if rth
+        if na(fFvgT) and not na(fz)
+            fFvgTop := fz.top
+            fFvgBot := fz.bottom
+            fFvgDir := fz.dir
+            fFvgT := ictt.nyMin(time)
+        if na(fCisdT) and (cBf or cUf)
+            fCisdLvl := cBf ? cBl : cUl
+            fCisdDir := cBf ? -1 : 1
+            fCisdT := ictt.nyMin(time)
+        if na(fMssT) and (mBf or mUf)
+            fMssRef := mBf ? mBr : mUr
+            fMssDir := mBf ? -1 : 1
+            fMssT := ictt.nyMin(time)
+        if na(fObT) and (not na(obBear) or not na(obBull))
+            fObKey := not na(obBear) ? obBear.key : obBull.key
+            fObDir := not na(obBear) ? -1 : 1
+            fObT := ictt.nyMin(time)
+plot(pMid, "P:midnight open", display = DW)
+plot(p830, "P:0830 open", display = DW)
+plot(p930, "P:0930 open", display = DW)
+plot(pOrgSet, "P:ORG settle", display = DW)
+plot(pOrgOpen, "P:ORG open", display = DW)
+plot(pOrgBand, "P:ORG band", display = DW)
+plot(pGapKind, "P:gap kind", display = DW)
+plot(pGapTop, "P:gap top", display = DW)
+plot(pGapBot, "P:gap bottom", display = DW)
+plot(pPdh, "P:PDH", display = DW)
+plot(pPdl, "P:PDL", display = DW)
+plot(pAsiaH, "P:Asia H", display = DW)
+plot(pAsiaL, "P:Asia L", display = DW)
+plot(pLonH, "P:London H", display = DW)
+plot(pLonL, "P:London L", display = DW)
+plot(nFvgB, "P:n BISI", display = DW)
+plot(nFvgS, "P:n SIBI", display = DW)
+plot(nIfvg, "P:n IFVG", display = DW)
+plot(nObS, "P:n bear OB", display = DW)
+plot(nObB, "P:n bull OB", display = DW)
+plot(nBrk, "P:n breaker", display = DW)
+plot(nCisd, "P:n CISD", display = DW)
+plot(nMss, "P:n MSS", display = DW)
+plot(nEq, "P:n EQ pools", display = DW)
+plot(nSw, "P:n swings", display = DW)
+plot(fFvgTop, "P:1st RTH FVG top", display = DW)
+plot(fFvgBot, "P:1st RTH FVG bottom", display = DW)
+plot(fFvgDir, "P:1st RTH FVG dir", display = DW)
+plot(fFvgT, "P:1st RTH FVG min", display = DW)
+plot(fCisdLvl, "P:1st RTH CISD level", display = DW)
+plot(fCisdDir, "P:1st RTH CISD dir", display = DW)
+plot(fCisdT, "P:1st RTH CISD min", display = DW)
+plot(fMssRef, "P:1st RTH MSS ref", display = DW)
+plot(fMssDir, "P:1st RTH MSS dir", display = DW)
+plot(fMssT, "P:1st RTH MSS min", display = DW)
+plot(fObKey, "P:1st RTH OB key", display = DW)
+plot(fObDir, "P:1st RTH OB dir", display = DW)
+plot(fObT, "P:1st RTH OB min", display = DW)

@@ -1,0 +1,381 @@
+//@version=6
+// ICT Dealing Range + Draw on Liquidity (TEST)
+// - HTF dealing range -> premium / discount (EQ = 0.5)
+// - Only marks: liquidity sweep (optional turtle soup) -> MSS (trade-through) -> displacement FVG
+//   bullish in discount, bearish in premium, optional macro filter (xx:50-xx:10 NY)
+// - DOL: heuristic score of HTF liquidity pools + daily hit-rate tracker (calibration seed for the bot)
+// Cards: kb/concepts/{premium-discount, swing-points, turtle-soup, mss, displacement, fvg, macros-time-windows}.md
+indicator("ICT Dealing Range + DOL (test)", "ICT DR+DOL", overlay = true, max_boxes_count = 300, max_lines_count = 400, max_labels_count = 300)
+
+// ───────── Inputs
+gDR = "Dealing range (HTF)"
+htf      = input.timeframe("240", "HTF", group = gDR)
+drMode   = input.string("Swing", "Mode", options = ["Swing", "Lookback"], group = gDR, tooltip = "Swing: last confirmed HTF swing high & swing low. Lookback: highest high / lowest low of the last N HTF bars.")
+htfPivot = input.int(2, "HTF swing strength (bars each side)", minval = 1, group = gDR)
+drLook   = input.int(20, "Lookback HTF bars", minval = 5, group = gDR)
+showDR   = input.bool(true, "Show premium / discount", group = gDR)
+showN    = input.int(3, "Show last N dealing ranges", minval = 1, maxval = 10, group = gDR)
+
+gSet = "Setups (chart TF)"
+swLen    = input.int(1, "Swing strength (1 = 3-bar swing)", minval = 1, group = gSet)
+maxPools = input.int(10, "Tracked pools per side", minval = 1, maxval = 50, group = gSet)
+mssWin   = input.int(30, "Max bars sweep -> MSS", minval = 3, group = gSet)
+tsBars   = input.int(3, "Turtle soup: close back inside within N bars", minval = 1, group = gSet)
+needTS   = input.bool(false, "Require turtle soup", group = gSet)
+dispK    = input.float(1.2, "Displacement: FVG middle body >= k x ATR(14)", step = 0.1, group = gSet)
+minFvgT  = input.int(4, "Min FVG size (ticks)", minval = 1, group = gSet)
+zoneOn   = input.bool(true, "Bullish only in discount / bearish only in premium", group = gSet)
+macroOn  = input.bool(false, "Only in macro windows (xx:50-xx:10 NY)", group = gSet)
+macroLH  = input.bool(true, "Also 15:15-15:45 last-hour macro", group = gSet)
+dolAlign = input.bool(false, "Only setups in DOL direction", group = gSet)
+extBars  = input.int(40, "FVG box length (bars)", minval = 5, group = gSet)
+
+gDol = "Draw on liquidity (test)"
+showDol  = input.bool(true, "Show DOL target + table", group = gDol)
+wPWx     = input.float(3.0, "Weight: previous week H/L", group = gDol)
+wPDx     = input.float(2.0, "Weight: previous day H/L", group = gDol)
+wDRx     = input.float(2.5, "Weight: HTF dealing-range H/L", group = gDol)
+wPD      = input.float(1.5, "Bonus: price in opposite zone (discount -> buy-side, premium -> sell-side)", group = gDol)
+wFlow    = input.float(2.0, "Bonus: HTF order flow agrees", group = gDol)
+wJudas   = input.float(1.5, "Bonus: opposite daily side already raided today", group = gDol)
+wDist    = input.float(1.5, "Bonus: nearness (full bonus at 0, none beyond max)", group = gDol)
+maxDistA = input.float(2.0, "Max distance (x daily ATR)", minval = 0.1, group = gDol)
+
+// ───────── Helpers
+atr = ta.atr(14)
+mt = syminfo.mintick
+
+f_macro(t) =>
+    h = hour(t, "America/New_York")
+    m = minute(t, "America/New_York")
+    (m >= 50 or m < 10) or (macroLH and h == 15 and m >= 15 and m < 45)
+
+// ───────── HTF dealing range (confirmed HTF bars only: [1] + lookahead_on = no repaint)
+htfCalc() =>
+    hph = ta.pivothigh(high, htfPivot, htfPivot)
+    hpl = ta.pivotlow(low, htfPivot, htfPivot)
+    sh = ta.valuewhen(not na(hph), hph, 0)
+    sl = ta.valuewhen(not na(hpl), hpl, 0)
+    hh = ta.highest(high, drLook)
+    ll = ta.lowest(low, drLook)
+    var int bias = 0
+    if not na(sh) and close > sh
+        bias := 1
+    else if not na(sl) and close < sl
+        bias := -1
+    [sh[1], sl[1], hh[1], ll[1], bias[1]]
+
+[hSH, hSL, hHH, hLL, hBias] = request.security(syminfo.tickerid, htf, htfCalc(), lookahead = barmerge.lookahead_on)
+
+drHi = drMode == "Swing" ? math.max(hSH, hSL) : hHH
+drLo = drMode == "Swing" ? math.min(hSH, hSL) : hLL
+eq   = (drHi + drLo) / 2
+
+// Draw only the last N dealing ranges as boxes (premium / discount) + EQ line; the newest one extends with price
+var box[]  drPrem = array.new<box>()
+var box[]  drDisc = array.new<box>()
+var line[] drEq   = array.new<line>()
+newRange = not na(drHi) and not na(drLo) and (drHi != drHi[1] or drLo != drLo[1])
+if showDR and newRange
+    array.push(drPrem, box.new(bar_index, drHi, bar_index + 1, eq, border_color = color.new(color.red, 60), bgcolor = color.new(color.red, 90), text = "Premium", text_size = size.tiny, text_color = color.new(color.red, 30), text_halign = text.align_right, text_valign = text.align_top))
+    array.push(drDisc, box.new(bar_index, eq, bar_index + 1, drLo, border_color = color.new(color.green, 60), bgcolor = color.new(color.green, 90), text = "Discount", text_size = size.tiny, text_color = color.new(color.green, 30), text_halign = text.align_right, text_valign = text.align_bottom))
+    array.push(drEq, line.new(bar_index, eq, bar_index + 1, eq, color = color.new(color.gray, 20), style = line.style_dashed))
+    if array.size(drPrem) > showN
+        box.delete(array.shift(drPrem))
+        box.delete(array.shift(drDisc))
+        line.delete(array.shift(drEq))
+if showDR and array.size(drPrem) > 0
+    box.set_right(array.last(drPrem), bar_index)
+    box.set_right(array.last(drDisc), bar_index)
+    line.set_x2(array.last(drEq), bar_index)
+
+// ───────── Chart-TF swings -> liquidity pools
+ph = ta.pivothigh(high, swLen, swLen)
+pl = ta.pivotlow(low, swLen, swLen)
+
+var float[] bslP = array.new<float>()
+var int[]   bslB = array.new<int>()
+var float[] sslP = array.new<float>()
+var int[]   sslB = array.new<int>()
+var float lastSH = na
+var int   lastSHb = na
+var float lastSL = na
+var int   lastSLb = na
+
+f_push(float[] ap, int[] ab, float p, int b) =>
+    array.push(ap, p)
+    array.push(ab, b)
+    if array.size(ap) > maxPools
+        array.shift(ap)
+        array.shift(ab)
+
+if not na(ph)
+    lastSH := ph
+    lastSHb := bar_index - swLen
+    f_push(bslP, bslB, ph, lastSHb)
+if not na(pl)
+    lastSL := pl
+    lastSLb := bar_index - swLen
+    f_push(sslP, sslB, pl, lastSLb)
+
+// sweep: trade-through by >= 1 mt; returns the most extreme pool taken this bar and removes all taken pools
+f_sweep(float[] ap, int[] ab, bool isLow) =>
+    float best = na
+    int bestB = na
+    int i = array.size(ap) - 1
+    while i >= 0
+        p = array.get(ap, i)
+        taken = isLow ? low <= p - mt : high >= p + mt
+        if taken
+            if na(best) or (isLow ? p < best : p > best)
+                best := p
+                bestB := array.get(ab, i)
+            array.remove(ap, i)
+            array.remove(ab, i)
+        i -= 1
+    [best, bestB]
+
+[sslHit, sslHitB] = f_sweep(sslP, sslB, true)
+[bslHit, bslHitB] = f_sweep(bslP, bslB, false)
+
+// ───────── Draw on liquidity (computed before setups so setups can align to it)
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_on)
+pwh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on)
+pwl = request.security(syminfo.tickerid, "W", low[1], lookahead = barmerge.lookahead_on)
+dAtr = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+
+newDay  = timeframe.change("D")
+newWeek = timeframe.change("W")
+var float dHi = na
+var float dLo = na
+var float wHi = na
+var float wLo = na
+dHi := newDay or na(dHi) ? high : math.max(dHi, high)
+dLo := newDay or na(dLo) ? low : math.min(dLo, low)
+wHi := newWeek or na(wHi) ? high : math.max(wHi, high)
+wLo := newWeek or na(wLo) ? low : math.min(wLo, low)
+
+var bool drHiTaken = false
+var bool drLoTaken = false
+if drHi != drHi[1]
+    drHiTaken := false
+if drLo != drLo[1]
+    drLoTaken := false
+if high >= drHi + mt
+    drHiTaken := true
+if low <= drLo - mt
+    drLoTaken := true
+
+f_score(float price, int side, float baseW, bool taken) =>
+    float s = na
+    if not taken and not na(price) and not na(dAtr)
+        s := baseW
+        s += (side == 1 and close < eq) or (side == -1 and close > eq) ? wPD : 0.0
+        s += side == hBias ? wFlow : 0.0
+        judas = side == 1 ? dLo < pdl : dHi > pdh
+        s += judas ? wJudas : 0.0
+        s += wDist * (1 - math.min(math.abs(price - close) / (maxDistA * dAtr), 1))
+    s
+
+names  = array.from("PWH", "PWL", "PDH", "PDL", "DR-H", "DR-L")
+prices = array.from(pwh, pwl, pdh, pdl, drHi, drLo)
+sides  = array.from(1, -1, 1, -1, 1, -1)
+takens = array.from(wHi >= pwh + mt, wLo <= pwl - mt, dHi >= pdh + mt, dLo <= pdl - mt, drHiTaken, drLoTaken)
+weights = array.from(wPWx, wPWx, wPDx, wPDx, wDRx, wDRx)
+
+scores = array.new<float>(6, na)
+int   bestI = na
+float bestS = na
+for i = 0 to 5
+    s = f_score(array.get(prices, i), array.get(sides, i), array.get(weights, i), array.get(takens, i))
+    array.set(scores, i, s)
+    if not na(s) and (na(bestS) or s > bestS)
+        bestS := s
+        bestI := i
+dolSide  = na(bestI) ? 0 : array.get(sides, bestI)
+dolPrice = na(bestI) ? na : array.get(prices, bestI)
+
+// best opposite-side candidate (for hit tracking)
+int oppI = na
+float oppS = na
+for i = 0 to 5
+    s = array.get(scores, i)
+    if not na(s) and array.get(sides, i) == -dolSide and (na(oppS) or s > oppS)
+        oppS := s
+        oppI := i
+
+// ───────── Daily hit tracker: lock the DOL at the day's first bar; which side is reached first?
+var float predT = na
+var float predO = na
+var int   predSide = 0
+var bool  pending = false
+var int nHit = 0
+var int nMiss = 0
+var int nNone = 0
+var int nBoth = 0
+if newDay
+    if pending
+        nNone += 1
+    pending := not na(bestI) and not na(oppI)
+    predT := dolPrice
+    predO := na(oppI) ? na : array.get(prices, oppI)
+    predSide := dolSide
+if pending and not newDay
+    hitT = predSide == 1 ? high >= predT : low <= predT
+    hitO = predSide == 1 ? low <= predO : high >= predO
+    if hitT and hitO
+        nBoth += 1
+        pending := false
+    else if hitT
+        nHit += 1
+        pending := false
+    else if hitO
+        nMiss += 1
+        pending := false
+
+// ───────── Setup state machines (bullish / bearish mirror)
+var bool  bArm = false
+var int   bSwB = na
+var float bSwL = na
+var int   bSwPB = na
+var float bRef = na
+var bool  bTS = false
+var bool  bZone = false
+var bool  bMac = false
+var int   bMssB = na
+var float bFT = na
+var float bFB = na
+var int   bFL = na
+
+var bool  sArm = false
+var int   sSwB = na
+var float sSwL = na
+var int   sSwPB = na
+var float sRef = na
+var bool  sTS = false
+var bool  sZone = false
+var bool  sMac = false
+var int   sMssB = na
+var float sFT = na
+var float sFB = na
+var int   sFL = na
+
+// new sweeps (re)arm
+if not na(sslHit)
+    bArm := true
+    bSwB := bar_index
+    bSwL := sslHit
+    bSwPB := sslHitB
+    bRef := lastSH
+    bTS := false
+    bZone := not zoneOn or sslHit < eq
+    bMac := false
+    bMssB := na
+    bFL := na
+if not na(bslHit)
+    sArm := true
+    sSwB := bar_index
+    sSwL := bslHit
+    sSwPB := bslHitB
+    sRef := lastSL
+    sTS := false
+    sZone := not zoneOn or bslHit > eq
+    sMac := false
+    sMssB := na
+    sFL := na
+
+// displacement FVGs (gap between bar[2] and bar[0], middle candle bar[1])
+bullFvg = low > high[2] and (low - high[2]) >= minFvgT * mt and close[1] > open[1] and (close[1] - open[1]) >= dispK * atr[1]
+bearFvg = high < low[2] and (low[2] - high) >= minFvgT * mt and close[1] < open[1] and (open[1] - close[1]) >= dispK * atr[1]
+
+f_drawSetup(bool isBull, float top, float bot, int left, float swL, int swPB, int swB, float ref, int mssB, bool ts) =>
+    col = isBull ? color.teal : color.maroon
+    box.new(left, top, left + extBars, bot, border_color = color.new(col, 40), bgcolor = color.new(col, 80))
+    ce = (top + bot) / 2
+    line.new(left, ce, left + extBars, ce, color = color.new(color.gray, 20), style = line.style_dashed)
+    line.new(swPB, swL, swB, swL, color = col, style = line.style_dotted)
+    label.new(swB, swL, ts ? "TS" : (isBull ? "SSL swept" : "BSL swept"), color = color.new(col, 100), textcolor = col, style = isBull ? label.style_label_up : label.style_label_down, size = size.small)
+    line.new(mssB - 3, ref, mssB, ref, color = col, width = 2)
+    label.new(mssB, ref, "MSS", color = color.new(col, 100), textcolor = col, style = isBull ? label.style_label_down : label.style_label_up, size = size.small)
+
+bullSig = false
+bearSig = false
+
+// bullish
+if bArm
+    if na(bRef)
+        bRef := lastSH
+    if close > bSwL and bar_index - bSwB <= tsBars
+        bTS := true
+    if bullFvg and bar_index - 1 >= bSwB
+        bFT := low
+        bFB := high[2]
+        bFL := bar_index - 2
+        bMac := bMac or f_macro(time[1])
+    if na(bMssB) and not na(bRef) and high >= bRef + mt
+        bMssB := bar_index
+        bMac := bMac or f_macro(time)
+    if not na(bMssB) and not na(bFL)
+        ok = bZone and (not needTS or bTS) and (not macroOn or bMac) and (not dolAlign or dolSide == 1)
+        if ok
+            bullSig := true
+            f_drawSetup(true, bFT, bFB, bFL, bSwL, bSwPB, bSwB, bRef, bMssB, bTS)
+        bArm := false
+    else if (na(bMssB) and bar_index - bSwB > mssWin) or (not na(bMssB) and bar_index - bMssB > 3)
+        bArm := false
+
+// bearish
+if sArm
+    if na(sRef)
+        sRef := lastSL
+    if close < sSwL and bar_index - sSwB <= tsBars
+        sTS := true
+    if bearFvg and bar_index - 1 >= sSwB
+        sFT := low[2]
+        sFB := high
+        sFL := bar_index - 2
+        sMac := sMac or f_macro(time[1])
+    if na(sMssB) and not na(sRef) and low <= sRef - mt
+        sMssB := bar_index
+        sMac := sMac or f_macro(time)
+    if not na(sMssB) and not na(sFL)
+        ok = sZone and (not needTS or sTS) and (not macroOn or sMac) and (not dolAlign or dolSide == -1)
+        if ok
+            bearSig := true
+            f_drawSetup(false, sFT, sFB, sFL, sSwL, sSwPB, sSwB, sRef, sMssB, sTS)
+        sArm := false
+    else if (na(sMssB) and bar_index - sSwB > mssWin) or (not na(sMssB) and bar_index - sMssB > 3)
+        sArm := false
+
+alertcondition(bullSig, "Bullish setup", "ICT DR: SSL sweep -> MSS -> displacement FVG (discount)")
+alertcondition(bearSig, "Bearish setup", "ICT DR: BSL sweep -> MSS -> displacement FVG (premium)")
+
+// ───────── DOL display
+var line  dolLine = na
+var label dolLbl = na
+var table tbl = table.new(position.top_right, 4, 9, bgcolor = color.new(color.black, 20), border_width = 1)
+if barstate.islast and showDol
+    line.delete(dolLine)
+    label.delete(dolLbl)
+    if not na(dolPrice)
+        dcol = dolSide == 1 ? color.teal : color.maroon
+        dolLine := line.new(bar_index, dolPrice, bar_index + 30, dolPrice, color = dcol, width = 2, style = line.style_dashed)
+        dolLbl := label.new(bar_index + 30, dolPrice, "DOL " + array.get(names, bestI) + "  " + str.tostring(dolPrice, format.mintick) + "  (" + str.tostring(bestS, "#.0") + ")", color = color.new(dcol, 100), textcolor = dcol, style = label.style_label_left, size = size.small)
+    table.cell(tbl, 0, 0, "Pool", text_color = color.white)
+    table.cell(tbl, 1, 0, "Price", text_color = color.white)
+    table.cell(tbl, 2, 0, "Score", text_color = color.white)
+    table.cell(tbl, 3, 0, "Status", text_color = color.white)
+    for i = 0 to 5
+        s = array.get(scores, i)
+        isBest = i == bestI
+        tc = isBest ? color.yellow : color.white
+        table.cell(tbl, 0, i + 1, array.get(names, i), text_color = tc)
+        table.cell(tbl, 1, i + 1, str.tostring(array.get(prices, i), format.mintick), text_color = tc)
+        table.cell(tbl, 2, i + 1, na(s) ? "-" : str.tostring(s, "#.0"), text_color = tc)
+        table.cell(tbl, 3, i + 1, array.get(takens, i) ? "taken" : (isBest ? "DOL" : "open"), text_color = tc)
+    tot = nHit + nMiss
+    table.cell(tbl, 0, 7, "Daily DOL first-touch", text_color = color.white)
+    table.merge_cells(tbl, 0, 7, 3, 7)
+    table.cell(tbl, 0, 8, "hit " + str.tostring(nHit) + " / miss " + str.tostring(nMiss) + (tot > 0 ? "  (" + str.tostring(100.0 * nHit / tot, "#") + "%)" : "") + "  none " + str.tostring(nNone) + "  both " + str.tostring(nBoth), text_color = color.white)
+    table.merge_cells(tbl, 0, 8, 3, 8)

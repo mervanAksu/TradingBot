@@ -1,0 +1,544 @@
+//@version=6
+// @description ICT-Bot price-action detectors (swings, pools, FVG/IFVG, VI, OB, breaker, CISD, MSS, wick CE, displacement).
+// Source of truth: kb/key-levels.md + kb/concepts/*.md. Conventions: bar [0] = newest closed bar; all events are
+// known at the close of bar [0] (no lookahead). Decisions a card left open are marked "DECISION" (see pine/README.md).
+library("ict_core", overlay = true)
+
+// ---------------------------------------------------------------- types
+// @type Zone  price zone. dir: +1 bullish, -1 bearish. state: 0 active, 1 tested, 2 weak (body beyond CE/MT), 3 failed/closed.
+// @field key  key price (OB key open, breaker L, pool level). @field ext_hi/ext_lo  extremes (stop anchors, H2, members).
+// @field quality  card-specific grade (pool A=1/B=2/C=3, ORG band). @field flag  card-specific flag (displaced, smooth).
+export type Zone
+    float  top
+    float  bottom
+    float  ce
+    float  q25
+    float  q75
+    int    dir
+    int    t_created
+    int    t_end
+    bool   mitigated = false
+    string kind      = ""
+    int    state     = 0
+    float  key
+    float  ext_hi
+    float  ext_lo
+    int    quality   = 0
+    bool   flag      = false
+
+// @type Level  single price level (opens, session H/L, swing points).
+export type Level
+    float  price
+    string kind
+    int    t
+    int    dir = 0
+
+// ---------------------------------------------------------------- helpers
+// @function Builds a Zone with CE (50%) and quadrants (25/75%) from top/bottom.
+export newZone(float top, float bottom, int dir, string kind, int t) =>
+    float rng = top - bottom
+    Zone.new(top, bottom, bottom + rng * 0.5, bottom + rng * 0.25, bottom + rng * 0.75, dir, t, na, false, kind)
+
+// @function True when two zones overlap in price (unicorn = breaker overlapping an FVG, breaker.md).
+export overlaps(Zone a, Zone b) =>
+    not na(a) and not na(b) and a.bottom <= b.top and b.bottom <= a.top
+
+// @function Gradient levels lo + f*(hi-lo), f = 0, 1/n .. 1 (gradient-levels.md VERIFIED, grid_n default 4).
+export grid(float lo, float hi, int n = 4) =>
+    array<float> lv = array.new<float>()
+    for i = 0 to n
+        lv.push(lo + (hi - lo) * i / n)
+    lv
+
+_dirOf(int off) => close[off] > open[off] ? 1 : close[off] < open[off] ? -1 : 0
+
+// ---------------------------------------------------------------- swing points
+// @function swing-points.md VERIFIED. Swing high at bar[len] confirmed at close of bar[0]: strictly above the `len` bars
+//   on the left, >= the `len` bars on the right (tie on the right allowed). len=1 -> 3-bar fractal (default).
+//   useBody=true reports max(open,close) of the pivot bar as the price (2026 body anchor). DECISION: detection stays on wicks.
+// @returns [isPivot, price, pivotTime, pivotBarIndex]
+export swingHigh(int len = 1, bool useBody = false) =>
+    bool ok = bar_index >= 2 * len
+    if ok
+        for i = 1 to len
+            if not (high[len] > high[len + i] and high[len] >= high[len - i])
+                ok := false
+    float p = ok ? (useBody ? math.max(open[len], close[len]) : high[len]) : na
+    [ok, p, ok ? time[len] : na, ok ? bar_index - len : na]
+
+// @function Swing low mirror of swingHigh. @returns [isPivot, price, pivotTime, pivotBarIndex]
+export swingLow(int len = 1, bool useBody = false) =>
+    bool ok = bar_index >= 2 * len
+    if ok
+        for i = 1 to len
+            if not (low[len] < low[len + i] and low[len] <= low[len - i])
+                ok := false
+    float p = ok ? (useBody ? math.min(open[len], close[len]) : low[len]) : na
+    [ok, p, ok ? time[len] : na, ok ? bar_index - len : na]
+
+// @function Nesting (swing-points.md): feed the STH stream -> ITH; feed the ITH stream -> LTH. Middle point must be
+//   strictly beyond both neighbours; confirmed when the next point prints. @returns [isNested, price, time]
+export nest(bool isNew, float price, int t, bool isHigh) =>
+    var float p1 = na
+    var float p2 = na
+    var int   t1 = na
+    bool  hit = false
+    float hp  = na
+    int   ht  = na
+    if isNew
+        if not na(p1) and not na(p2)
+            bool mid = isHigh ? (p1 > p2 and p1 > price) : (p1 < p2 and p1 < price)
+            if mid
+                hit := true
+                hp  := p1
+                ht  := t1
+        p2 := p1
+        p1 := price
+        t1 := t
+    [hit, hp, ht]
+
+// ---------------------------------------------------------------- relative equal highs / lows
+// @function relative-equal-hl.md VERIFIED-low. On each new swing b, pair it with the newest untaken older swing a with
+//   |a-b| <= tol and (rightShorter: b stops short of / equals a). Swings are dropped once traded through (run_mode trade).
+//   Returned Zone: top=bottom=key=pool level (max for highs, min for lows); quality A=1 (b short of a), B=2 (equal),
+//   C=3 (b beyond a, only when rightShorter=false); flag = smooth (no close beyond the level between a and b).
+//   DECISION: candidate list = last maxSwings untaken swings; "touches_between <= 1" not implemented.
+export eqPool(bool isNew, float price, int t, bool isHigh, float tol, bool rightShorter = true, int maxSwings = 10) =>
+    var array<float> ps = array.new<float>()
+    var array<int>   ts = array.new<int>()
+    var array<float> xc = array.new<float>()   // most extreme close since the swing
+    float s = isHigh ? 1.0 : -1.0
+    // drop taken swings, update extreme closes
+    if ps.size() > 0
+        for i = ps.size() - 1 to 0
+            if s * (isHigh ? high : low) > s * ps.get(i)
+                ps.remove(i)
+                ts.remove(i)
+                xc.remove(i)
+            else
+                xc.set(i, isHigh ? math.max(xc.get(i), close) : math.min(xc.get(i), close))
+    Zone z = na
+    if isNew
+        if ps.size() > 0
+            for i = ps.size() - 1 to 0
+                float a = ps.get(i)
+                bool inTol = math.abs(a - price) <= tol
+                bool order = not rightShorter or s * price <= s * a
+                if inTol and order
+                    float lvl = isHigh ? math.max(a, price) : math.min(a, price)
+                    z := newZone(lvl, lvl, isHigh ? 1 : -1, isHigh ? "EQH" : "EQL", t)
+                    z.key     := lvl
+                    z.ext_hi  := math.max(a, price)
+                    z.ext_lo  := math.min(a, price)
+                    z.quality := s * price < s * a ? 1 : price == a ? 2 : 3
+                    z.flag    := s * xc.get(i) <= s * lvl
+                    z.t_created := ts.get(i)
+                    break
+        ps.push(price)
+        ts.push(t)
+        xc.push(close)
+        if ps.size() > maxSwings
+            ps.shift()
+            ts.shift()
+            xc.shift()
+    z
+
+// ---------------------------------------------------------------- displacement (proxy)
+// @function displacement.md VERIFIED-low (proxy). Bar is displacement when body >= bodyAtr*ATR(atrLen),
+//   close in the outer closePos of its range, body >= minBody. @returns +1 / -1 / 0
+export displacementBar(float bodyAtr = 1.0, float closePos = 0.7, simple int atrLen = 14, float minBody = 0.0) =>
+    float atr  = ta.atr(atrLen)
+    float body = math.abs(close - open)
+    float rng  = high - low
+    int d = 0
+    if rng > 0 and body >= bodyAtr * atr and body >= minBody
+        if close > open and (close - low) / rng >= closePos
+            d := 1
+        else if close < open and (high - close) / rng >= closePos
+            d := -1
+    d
+
+// @function Displacement leg ending at bar[0]: <= maxBars consecutive same-direction bars, sum(body) >= legAtr*ATR,
+//   and >= 1 FVG created inside the leg (fvgBull/fvgBear = FVG-created flags of the bars). @returns +1 / -1 / 0
+export displacementLeg(bool fvgBull, bool fvgBear, float legAtr = 1.5, int maxBars = 3, simple int atrLen = 14) =>
+    float atr = ta.atr(atrLen)
+    int d0 = _dirOf(0)
+    int res = 0
+    if d0 != 0 and bar_index > maxBars
+        float sumB = 0.0
+        bool gap = false
+        for i = 0 to maxBars - 1
+            if _dirOf(i) != d0
+                break
+            sumB += math.abs(close[i] - open[i])
+            gap := gap or (d0 == 1 ? fvgBull[i] : fvgBear[i])
+            if sumB >= legAtr * atr and gap
+                res := d0
+                break
+    res
+
+// ---------------------------------------------------------------- volume imbalance
+// @function volume-imbalance.md VERIFIED. Body-to-body gap >= minSize with wick overlap between bar[p] and bar[0];
+//   p = 2 when bar[1] has a zero body (skipped), else 1. @returns Zone or na
+export volumeImbalance(float minSize) =>
+    int p = close[1] == open[1] ? 2 : 1
+    Zone z = na
+    if bar_index > 2
+        float bh0 = math.max(open, close)
+        float bl0 = math.min(open, close)
+        float bhp = math.max(open[p], close[p])
+        float blp = math.min(open[p], close[p])
+        if bl0 > bhp and low <= high[p] and bl0 - bhp >= minSize
+            z := newZone(bl0, bhp, 1, "VI", time)
+        else if bh0 < blp and high >= low[p] and blp - bh0 >= minSize
+            z := newZone(blp, bh0, -1, "VI", time)
+    z
+
+// @function VI is closed when one later body spans it. @returns true on the bar it closes
+export viUpdate(Zone z) =>
+    bool closed = false
+    if not z.mitigated and time > z.t_created
+        if math.min(open, close) <= z.bottom and math.max(open, close) >= z.top
+            z.mitigated := true
+            z.state := 3
+            z.t_end := time
+            closed := true
+    closed
+
+// ---------------------------------------------------------------- FVG / IFVG
+// @function fvg.md VERIFIED. Bullish (BISI): low[0] > high[2], zone [high[2], low[0]]; bearish (SIBI): high[0] < low[2].
+//   size (wick gap) >= minSize. withVI: adjacent volume imbalance (c1-c2 or c2-c3) touching the gap edge extends the box
+//   (fvg_box "wick+VI"). flag = candle 2 is a displacement bar (c2Disp). DECISION: minSize tested before VI extension.
+export fvg(float minSize, bool withVI = true, bool c2Disp = false) =>
+    Zone z = na
+    if bar_index >= 2
+        if low > high[2] and low - high[2] >= minSize
+            float bot = high[2]
+            float top = low
+            if withVI
+                float bh2 = math.max(open[2], close[2])
+                float bl1 = math.min(open[1], close[1])
+                if bl1 > bh2 and low[1] <= high[2] and bl1 >= bot and bh2 < bot
+                    bot := bh2
+                float bh1 = math.max(open[1], close[1])
+                float bl0 = math.min(open, close)
+                if bl0 > bh1 and high[1] >= low and bh1 <= top and bl0 > top
+                    top := bl0
+            z := newZone(top, bot, 1, "FVG", time[2])
+        else if high < low[2] and low[2] - high >= minSize
+            float top = low[2]
+            float bot = high
+            if withVI
+                float bl2 = math.min(open[2], close[2])
+                float bh1 = math.max(open[1], close[1])
+                if bh1 < bl2 and high[1] >= low[2] and bh1 <= top and bl2 > top
+                    top := bl2
+                float bl1 = math.min(open[1], close[1])
+                float bh0 = math.max(open, close)
+                if bh0 < bl1 and low[1] <= high and bl1 >= bot and bh0 < bot
+                    bot := bh0
+            z := newZone(top, bot, -1, "FVG", time[2])
+        if not na(z)
+            z.flag := c2Disp
+            z.ext_hi := z.dir == 1 ? na : high[2]   // c1 extreme (stop anchor, fvg.md stop_anchor)
+            z.ext_lo := z.dir == 1 ? low[2] : na
+    z
+
+// @function FVG state machine (fvg.md): tested on first wick into zone, weak on body close beyond CE,
+//   failed on body close beyond the far edge (respect_test close_beyond_far_edge). Call from the bar after creation.
+// @returns 1 on the bar the FVG fails (caller spawns IFVG via ifvgFrom), else 0
+export fvgUpdate(Zone z) =>
+    int ev = 0
+    if not z.mitigated
+        bool bull = z.dir == 1
+        if z.state == 0 and (bull ? low <= z.top : high >= z.bottom)
+            z.state := 1
+        if z.state < 2 and (bull ? close < z.ce : close > z.ce)
+            z.state := 2
+        if bull ? close < z.bottom : close > z.top
+            z.state := 3
+            z.mitigated := true
+            z.t_end := time
+            ev := 1
+    ev
+
+// @function ifvg.md VERIFIED (ifvg_mode one_close). New IFVG from a failed FVG: same prices, opposite direction.
+export ifvgFrom(Zone z) =>
+    Zone n = newZone(z.top, z.bottom, -z.dir, "IFVG", time)
+    n.key := z.dir == 1 ? z.bottom : z.top     // inversion edge
+    n
+
+// @function IFVG validity (ifvg.md half_rule ce): bearish IFVG fails on close > CE, is "reclaimed" on close > top
+//   (mirror bullish). @returns 0 none, 1 failed (half rule), 2 reclaimed
+export ifvgUpdate(Zone z) =>
+    int ev = 0
+    if not z.mitigated and time > z.t_created
+        bool bear = z.dir == -1
+        if z.state == 0 and (bear ? high >= z.bottom : low <= z.top)
+            z.state := 1
+        if bear ? close > z.top : close < z.bottom
+            ev := 2
+        else if bear ? close > z.ce : close < z.ce
+            ev := 1
+        if ev > 0
+            z.state := 3
+            z.mitigated := true
+            z.t_end := time
+    ev
+
+// ---------------------------------------------------------------- order block
+// @function order-block.md VERIFIED. Bearish OB = run of up-close candles (dojis continue the run, capped at maxRun
+//   newest bars) followed by a down-close candle; key = open of the FIRST candle of the run (ob_key_open first);
+//   validated when a later bar trades below key (ob_validation trade_through). Zone: top = max body, bottom = key
+//   (bullish: bottom = min body, top = key); ce = MT; ext_hi/ext_lo = run extreme (stop anchor).
+//   DECISION: one pending candidate per side; a newer run replaces an unvalidated older one.
+// @returns [bearishOB, bullishOB] validated on this bar (or na)
+export orderBlock(int maxRun = 5) =>
+    var Zone pBear = na
+    var Zone pBull = na
+    if bar_index > maxRun + 1
+        for side = 0 to 1
+            int d = side == 0 ? 1 : -1      // run direction: up-close run -> bearish OB
+            if _dirOf(0) == -d and _dirOf(1) == d
+                int f = 1
+                while f < maxRun and _dirOf(f + 1) != -d
+                    f += 1
+                while f > 1 and _dirOf(f) == 0
+                    f -= 1
+                float key = open[f]
+                float bt = math.max(open[1], close[1])
+                float bb = math.min(open[1], close[1])
+                float hx = high[1]
+                float lx = low[1]
+                for j = 1 to f
+                    bt := math.max(bt, open[j], close[j])
+                    bb := math.min(bb, open[j], close[j])
+                    hx := math.max(hx, high[j])
+                    lx := math.min(lx, low[j])
+                Zone z = d == 1 ? newZone(bt, key, -1, "OB", time[f]) : newZone(key, bb, 1, "OB", time[f])
+                z.key := key
+                z.ext_hi := hx
+                z.ext_lo := lx
+                if d == 1
+                    pBear := z
+                else
+                    pBull := z
+    Zone vBear = na
+    Zone vBull = na
+    if not na(pBear) and low < pBear.key
+        vBear := pBear
+        pBear := na
+    if not na(pBull) and high > pBull.key
+        vBull := pBull
+        pBull := na
+    [vBear, vBull]
+
+// @function OB / breaker validity: bearish fails on a body close above MT (ce), bullish below (ob_fail mt).
+//   tested on first touch of the near edge. @returns true on the failing bar
+export blockUpdate(Zone z) =>
+    bool failed = false
+    if not z.mitigated
+        bool bear = z.dir == -1
+        if z.state == 0 and (bear ? high >= z.bottom : low <= z.top)
+            z.state := 1
+        if bear ? close > z.ce : close < z.ce
+            z.state := 3
+            z.mitigated := true
+            z.t_end := time
+            failed := true
+    failed
+
+// ---------------------------------------------------------------- breaker
+_breakerSide(bool bear, bool newExt, float extP, int extI, bool newOpp, float oppP, int oppI, float sweepMin, bool closeMode, int maxRun, int maxBack) =>
+    var array<float> oP = array.new<float>()
+    var array<int>   oI = array.new<int>()
+    var float prevExt  = na
+    var int   prevExtI = na
+    var float aL  = na
+    var int   aLI = na
+    var float aH1 = na
+    var float aH2 = na
+    float s = bear ? 1.0 : -1.0
+    if newOpp
+        oP.push(oppP)
+        oI.push(oppI)
+        if oP.size() > 50
+            oP.shift()
+            oI.shift()
+    if newExt
+        if not na(prevExt) and s * extP > s * prevExt + sweepMin
+            float best = na
+            int   bestI = na
+            if oP.size() > 0
+                for k = 0 to oP.size() - 1
+                    int ii = oI.get(k)
+                    if ii > prevExtI and ii < extI and (na(best) or s * oP.get(k) < s * best)
+                        best  := oP.get(k)
+                        bestI := ii
+            if not na(best)
+                aH1 := prevExt
+                aL  := best
+                aLI := bestI
+                aH2 := extP
+            else if not na(aH2) and s * extP > s * aH2
+                aH2 := extP
+        prevExt  := extP
+        prevExtI := extI
+    Zone z = na
+    if not na(aL)
+        float px = closeMode ? close : (bear ? low : high)
+        if s * px < s * aL
+            int o0 = bar_index - aLI
+            int st = na
+            if o0 + 5 <= maxBack
+                for j = o0 to o0 + 5
+                    if s * (close[j] - open[j]) < 0
+                        st := j
+                        break
+            if not na(st)
+                float bt = math.max(open[st], close[st])
+                float bb = math.min(open[st], close[st])
+                int j = st + 1
+                int n = 1
+                while n < maxRun and j <= maxBack and s * (close[j] - open[j]) < 0
+                    bt := math.max(bt, open[j], close[j])
+                    bb := math.min(bb, open[j], close[j])
+                    j += 1
+                    n += 1
+                z := newZone(bt, bb, bear ? -1 : 1, "BRK", time[j - 1])
+                z.key := aL
+                z.ext_hi := bear ? aH2 : aH1
+                z.ext_lo := bear ? aH1 : aH2
+            aL  := na
+            aLI := na
+            aH1 := na
+            aH2 := na
+    z
+
+// @function breaker.md VERIFIED. Bearish: STH H1, STL L after H1, STH H2 > H1 + sweepMin, then a bar trades below L
+//   (closeMode=false, brk_mode trade) -> zone = bodies of the down-close run at/just before the L bar (<= maxRun bars),
+//   MT = ce. Bullish mirror. ext_hi/ext_lo hold H2/H1 (bear) or H1/H2 (bull). Feed swing pivots (price, pivot bar_index).
+//   DECISIONS: H1 = the STH immediately before H2; L = lowest STL between H1 and H2; a higher STH without a new STL
+//   extends H2; the block search looks back <= 5 bars from L for the first down-close candle.
+// @returns [bearishBreaker, bullishBreaker] created on this bar (or na)
+export breaker(bool isSH, float shP, int shI, bool isSL, float slP, int slI, float sweepMin = 0.0, bool closeMode = false, int maxRun = 5, int maxBack = 450) =>
+    Zone b1 = _breakerSide(true, isSH, shP, shI, isSL, slP, slI, sweepMin, closeMode, maxRun, maxBack)
+    Zone b2 = _breakerSide(false, isSL, slP, slI, isSH, shP, shI, sweepMin, closeMode, maxRun, maxBack)
+    [b1, b2]
+
+// ---------------------------------------------------------------- CISD
+_cisdSide(bool bear, bool newPivot, int maxSeries, int maxBars, bool closeMode) =>
+    var float lvl = na
+    var int   armed = na
+    var int   tS = na
+    float s = bear ? 1.0 : -1.0     // bear: delivering series = up-close candles into the high
+    bool  fired = false
+    float fL = na
+    int   fT = na
+    if newPivot and bar_index > maxSeries + 3
+        int e = na
+        if s * (close[1] - open[1]) > 0
+            e := s * (close - open) > 0 ? 0 : 1
+        else if s * (close[2] - open[2]) > 0
+            e := 2
+        if not na(e)
+            int f = e
+            int n = 1
+            while n < maxSeries and s * (close[f + 1] - open[f + 1]) >= 0
+                f += 1
+                n += 1
+            while f > e and close[f] == open[f]
+                f -= 1
+            lvl   := open[f]
+            armed := bar_index
+            tS    := time[f]
+    if not na(lvl)
+        if bar_index - armed > maxBars
+            lvl := na
+        else
+            float px = closeMode ? close : (bear ? low : high)
+            if s * px < s * lvl
+                fired := true
+                fL := lvl
+                fT := tS
+                lvl := na
+    [fired, fL, fT]
+
+// @function cisd.md VERIFIED (cisd_anchor series_first_open, cisd_mode trade). When a swing high is confirmed
+//   (isSH), the delivering series = consecutive up-close candles (dojis continue) ending at the pivot bar, or at
+//   bar[0] if it continues the run, or at bar[2] if the pivot bar itself is down-close; level = open of its first
+//   candle. Bearish CISD fires on the first trade below the level (closeMode: close below) within maxBars.
+//   Bullish mirror on swing lows. DECISION: series boundary rule above; maxSeries 10; a new pivot re-arms.
+// @returns [bearFired, bearLevel, bearSeriesStartTime, bullFired, bullLevel, bullSeriesStartTime]
+export cisd(bool isSH, bool isSL, int maxSeries = 10, int maxBars = 30, bool closeMode = false) =>
+    [f1, l1, t1] = _cisdSide(true, isSH, maxSeries, maxBars, closeMode)
+    [f2, l2, t2] = _cisdSide(false, isSL, maxSeries, maxBars, closeMode)
+    [f1, l1, t1, f2, l2, t2]
+
+// ---------------------------------------------------------------- MSS
+_mssSide(bool bear, bool newPool, float poolP, bool newRef, float refP, bool extRaid, int dispDir, int maxBars, bool closeMode, bool needDisp) =>
+    var float pool = na
+    var float lastRef = na
+    var float ref = na
+    var int   r = na
+    var bool  disp = false
+    float s = bear ? 1.0 : -1.0
+    int want = bear ? -1 : 1
+    bool  fired = false
+    float fRef = na
+    if not na(ref)
+        if bar_index - r > maxBars
+            ref := na
+        else
+            disp := disp or dispDir == want
+            float px = closeMode ? close : (bear ? low : high)
+            if s * px < s * ref and (disp or not needDisp)
+                fired := true
+                fRef := ref
+                ref := na
+    bool raid = (not na(pool) and s * (bear ? high : low) > s * pool) or extRaid
+    if raid and not na(lastRef)
+        r := bar_index
+        ref := lastRef
+        disp := dispDir == want
+        pool := na
+    if newPool
+        pool := poolP
+    if newRef
+        lastRef := refP
+    [fired, fRef]
+
+// @function mss.md VERIFIED (mss_mode trade, mss_need_displacement true). Bearish: after a raid (trade above the
+//   most recent confirmed STH, or extRaidUp from a caller-defined pool), a bar within maxBars trades below the last
+//   STL confirmed before the raid, with a bearish displacement bar between raid and break. Bullish mirror.
+//   DECISION: default pool = latest confirmed opposite swing; displacement = displacementBar() proxy.
+// @returns [bearFired, bearRef, bullFired, bullRef]
+export mss(bool isSH, float shP, bool isSL, float slP, int dispDir, bool extRaidUp = false, bool extRaidDn = false, int maxBars = 20, bool closeMode = false, bool needDisp = true) =>
+    [f1, r1] = _mssSide(true, isSH, shP, isSL, slP, extRaidUp, dispDir, maxBars, closeMode, needDisp)
+    [f2, r2] = _mssSide(false, isSL, slP, isSH, shP, extRaidDn, dispDir, maxBars, closeMode, needDisp)
+    [f1, r1, f2, r2]
+
+// ---------------------------------------------------------------- wick CE
+// @function wick-ce.md VERIFIED (wick_anchor body_edge). Wick of bar[off] as a zone: upper [bodyHi, high] (dir -1,
+//   premium wick), lower [low, bodyLo] (dir +1). Prominent if length >= minAtr*ATR(atrLen) or force (e.g. swing extreme).
+//   ce = 50%, q25/q75 quadrants. @returns Zone or na
+export wickZone(bool upper, int off = 0, float minAtr = 0.5, bool force = false, simple int atrLen = 14) =>
+    float atr = ta.atr(atrLen)
+    float bh = math.max(open[off], close[off])
+    float bl = math.min(open[off], close[off])
+    float len = upper ? high[off] - bh : bl - low[off]
+    Zone z = na
+    if len > 0 and (force or len >= minAtr * atr[off])
+        z := upper ? newZone(high[off], bh, -1, "WICK", time[off]) : newZone(bl, low[off], 1, "WICK", time[off])
+    z
+
+// @function Wick respect: premium wick fails on a body close above CE, discount wick on a close below CE.
+export wickUpdate(Zone z) =>
+    bool failed = false
+    if not z.mitigated and time > z.t_created
+        if z.dir == -1 ? close > z.ce : close < z.ce
+            z.mitigated := true
+            z.state := 3
+            z.t_end := time
+            failed := true
+    failed

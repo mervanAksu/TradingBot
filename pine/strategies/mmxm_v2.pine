@@ -1,0 +1,780 @@
+//@version=6
+// ICT MMXM v2 strategy v3.1 — nested premium/discount + dynamic risk. (Base: indicator) — liquidity rays, OC from relative-equal highs/lows, market-phase engine (Quarterly-Theory style
+// time grid + observed price behaviour), sequential SMT (SSMT) vs a correlated index, SMR signal with confluence score.
+// Ideas: kb/mmxm-spec.md, kb/concepts/{relative-equal-hl, smt, session-ranges, power-of-3}.md; quarter grid inspired by
+// Daye's Quarterly Theory (day 18:00-18:00 NY in four 6h quarters, each 6h session in four 90-min quarters, AMDX roles).
+strategy("ICT MMXM v2 strategy", "MMXM v2 S", overlay = true, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 4,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 2.5, slippage = 1, margin_long = 0, margin_short = 0,
+     pyramiding = 0, max_lines_count = 500, max_boxes_count = 200, max_labels_count = 300, max_bars_back = 500)
+
+// ───────── Inputs
+gL = "Liquidity rays"
+swLen     = input.int(2, "Swing strength (bars each side)", minval = 1, group = gL)
+maxRays   = input.int(8, "Open rays per side", minval = 1, maxval = 40, group = gL)
+keepTaken = input.bool(true, "Keep swept levels (ray stops at the sweep)", group = gL)
+eqTolK    = input.float(0.25, "Relative-equal tolerance (x ATR14)", step = 0.05, group = gL)
+eqTolT    = input.int(4, "Tolerance floor (ticks)", minval = 0, group = gL)
+colB      = input.color(color.new(color.red, 20), "Buy-side liquidity", group = gL)
+colS      = input.color(color.new(color.teal, 20), "Sell-side liquidity", group = gL)
+
+gO = "Original consolidation (EQH / EQL cluster)"
+ocSrc     = input.string("Both", "OC source", options = ["EQ cluster", "Session window", "Both"], group = gO, tooltip = "Session window: the completed range of a consolidation window (Dawacadu examples: pre-session 07:00-09:30, Asia 20:00-00:00, premarket 04:30-07:30).")
+ocSess    = input.session("0700-0930", "OC session window (NY)", group = gO)
+ocMode    = input.string("EQH or EQL", "EQ cluster needs", options = ["EQH or EQL", "EQH and EQL"], group = gO)
+ocMinBars = input.int(5, "Min bars between the equal points", minval = 2, group = gO)
+ocMaxBars = input.int(150, "Max bars between the equal points", minval = 10, maxval = 400, group = gO)
+ocMaxK    = input.float(4.0, "Max OC height (x ATR14)", step = 0.5, group = gO)
+dispK     = input.float(1.0, "Departure candle body >= k x ATR14", step = 0.1, group = gO)
+
+gS = "SMR (after OC departure)"
+htf     = input.timeframe("240", "HTF range for premium / discount", group = gS)
+htfLook = input.int(20, "HTF range lookback (HTF bars)", minval = 5, group = gS)
+zoneOn  = input.bool(true, "Raid must be in HTF premium (sell) / discount (buy)", group = gS)
+smrWin  = input.int(20, "Raid -> confirmation window (bars)", minval = 3, group = gS)
+confMin = input.float(3.0, "Min confirmation score", step = 0.5, group = gS)
+smtSym  = input.symbol("CME_MINI:ES1!", "Correlated symbol (NQ chart: ES1!, ES chart: NQ1!)", group = gS)
+smrSess = input.session("0830-1000,1130-1230", "SMR time windows (NY)", group = gS)
+showStg = input.bool(true, "Label stages (Acc. before SMR, Dist. after SMR)", group = gS)
+
+gR = "Orders / risk"
+nQty      = input.int(4, "Contracts", minval = 3, group = gR)
+q1        = input.int(2, "TP1 contracts", minval = 1, group = gR)
+q2        = input.int(1, "TP2 contracts", minval = 1, group = gR)
+stopPad   = input.int(2, "Stop pad beyond SMR extreme (ticks)", minval = 0, group = gR)
+minRoom   = input.float(15.0, "Min room entry -> TP1 (points; NQ 15, ES 4)", minval = 0, group = gR)
+armBars   = input.int(30, "Order valid for N bars after SMR", minval = 3, group = gR)
+macroOn   = input.bool(false, "Entries only in macro windows (xx:50-xx:10)", group = gR)
+phaseGate = input.bool(true, "Phase gate: no entry while the last quarter was CONS and no expansion yet", group = gR)
+flatOn    = input.bool(true, "Flat at 15:55 NY (intraday)", group = gR)
+
+gB = "HTF bias"
+biasTF  = input.timeframe("D", "Bias timeframe (structure)", group = gB)
+biasPiv = input.int(2, "Bias swing strength", minval = 1, group = gB)
+ctMode  = input.string("Cap at RR", "Counter-trend trades", options = ["Cap at RR", "Skip", "Allow full"], group = gB)
+ctRR    = input.float(2.0, "Counter-trend target cap (R multiple)", step = 0.5, group = gB)
+entryType = input.string("Limit or market", "Entry", options = ["Limit only (IFVG / first FVG)", "Limit or market"], group = gR)
+minStopK  = input.float(0.0, "Min stop distance (x ATR14)", step = 0.1, group = gR)
+
+gP = "Market phases (quarters)"
+cyc     = input.string("90 minutes", "Cycle for observed phases", options = ["90 minutes", "6-hour sessions"], group = gP)
+avgN    = input.int(20, "Range baseline (last N quarters)", minval = 5, group = gP)
+consK   = input.float(0.7, "Consolidation: range < k x baseline", step = 0.05, group = gP)
+expK    = input.float(1.3, "Expansion: range > k x baseline", step = 0.05, group = gP)
+showQ   = input.bool(false, "Draw quarter boundaries on the price chart", group = gP)
+
+gK = "Nested premium / discount"
+pdMode  = input.string("Net agreement >= min", "Premium/discount filter", options = ["Net agreement >= min", "All timeframes agree", "Off"], group = gK, tooltip = "Each timeframe gets a dealing range (last swing low -> swing high). Below 50% = discount (votes long), above = premium (votes short), inside the band = equilibrium (no vote). Buys need net discount votes, sells net premium votes.")
+pdTF1   = input.timeframe("D", "Range TF 1 (top, also HTF bias)", group = gK)
+pdTF2   = input.timeframe("240", "Range TF 2", group = gK)
+pdTF3   = input.timeframe("60", "Range TF 3", group = gK)
+pdChart = input.bool(true, "Use the chart timeframe as TF 4", group = gK)
+pdPiv   = input.int(3, "Range swing strength (bars each side)", minval = 1, group = gK)
+pdBand  = input.float(5.0, "Equilibrium band (+/- % of range around 50%)", step = 1.0, minval = 0, group = gK)
+pdMin   = input.int(2, "Min net agreement (agreeing TFs - opposing TFs)", minval = 1, maxval = 4, group = gK)
+biasSrc = input.string("Premium/discount of TF 1", "HTF bias for counter-trend rule", options = ["Premium/discount of TF 1", "Structure (bias TF swing breaks)"], group = gK)
+showPD  = input.bool(true, "Show premium/discount + risk table", group = gK)
+
+gZ = "Position sizing"
+sizeMode = input.string("Dynamic % risk", "Sizing", options = ["Dynamic % risk", "Fixed contracts"], group = gZ)
+baseRisk = input.float(5.0, "Base risk per trade (% of equity at the starting balance)", step = 0.5, minval = 0.1, group = gZ)
+minRisk  = input.float(1.0, "Risk floor (%)", step = 0.25, minval = 0.1, group = gZ)
+maxRisk  = input.float(8.0, "Risk ceiling (%)", step = 0.5, group = gZ)
+upStep   = input.float(0.15, "Risk raise per +10% equity above start (x base)", step = 0.05, group = gZ)
+dnStep   = input.float(0.35, "Risk cut per -10% equity below start (x base)", step = 0.05, group = gZ)
+ddStep   = input.float(0.25, "Risk cut per 10% drawdown from the equity peak (x)", step = 0.05, group = gZ)
+perfN    = input.int(10, "Adaptive: last N trades (0 = off)", minval = 0, maxval = 50, group = gZ)
+perfK    = input.float(0.15, "Adaptive: +/- risk when the last N trades net positive / negative", step = 0.05, group = gZ)
+ctRiskK  = input.float(0.5, "Counter-trend trades: risk multiplier", step = 0.1, minval = 0.1, group = gZ)
+maxQty   = input.int(40, "Max contracts", minval = 1, group = gZ)
+tp1Pct   = input.float(50.0, "TP1 share of contracts (%)", step = 5, group = gZ)
+tp2Pct   = input.float(25.0, "TP2 share of contracts (%)", step = 5, group = gZ)
+
+// ───────── Common
+mt  = syminfo.mintick
+atr = ta.atr(14)
+tol = math.max(eqTolK * atr, eqTolT * mt)
+oHi = request.security(smtSym, timeframe.period, high, lookahead = barmerge.lookahead_off)
+oLo = request.security(smtSym, timeframe.period, low, lookahead = barmerge.lookahead_off)
+oHpiv = ta.highest(oHi, 2 * swLen + 1)
+oLpiv = ta.lowest(oLo, 2 * swLen + 1)
+oH3 = ta.highest(oHi, 3)
+oL3 = ta.lowest(oLo, 3)
+
+[hHi, hLo] = request.security(syminfo.tickerid, htf, [ta.highest(high, htfLook)[1], ta.lowest(low, htfLook)[1]], lookahead = barmerge.lookahead_on)
+eq = (hHi + hLo) / 2
+biasCalc() =>
+    bph = ta.pivothigh(high, biasPiv, biasPiv)
+    bpl = ta.pivotlow(low, biasPiv, biasPiv)
+    bsh = ta.valuewhen(not na(bph), bph, 0)
+    bsl = ta.valuewhen(not na(bpl), bpl, 0)
+    var int b = 0
+    if not na(bsh) and close > bsh
+        b := 1
+    else if not na(bsl) and close < bsl
+        b := -1
+    b[1]
+htfBias = request.security(syminfo.tickerid, biasTF, biasCalc(), lookahead = barmerge.lookahead_on)
+
+// ───────── Nested premium / discount (matryoshka of dealing ranges)
+pdCalc(int piv) =>
+    ph = ta.pivothigh(high, piv, piv)
+    pl = ta.pivotlow(low, piv, piv)
+    var float h = na
+    var float l = na
+    if not na(ph)
+        h := ph
+    if not na(pl)
+        l := pl
+    h := na(h) ? high : math.max(h, high)
+    l := na(l) ? low : math.min(l, low)
+    [h, l]
+pdPrev(int piv) =>
+    [h, l] = pdCalc(piv)
+    [h[1], l[1]]
+[r1H, r1L] = request.security(syminfo.tickerid, pdTF1, pdPrev(pdPiv), lookahead = barmerge.lookahead_on)
+[r2H, r2L] = request.security(syminfo.tickerid, pdTF2, pdPrev(pdPiv), lookahead = barmerge.lookahead_on)
+[r3H, r3L] = request.security(syminfo.tickerid, pdTF3, pdPrev(pdPiv), lookahead = barmerge.lookahead_on)
+[r4H, r4L] = pdCalc(pdPiv)
+pdPos(float h, float l) =>
+    na(h) or na(l) or h - l <= 0 ? na : (close - l) / (h - l)
+pdZone(float p) =>
+    na(p) ? 0 : p < 0.5 - pdBand / 100 ? 1 : p > 0.5 + pdBand / 100 ? -1 : 0
+p1 = pdPos(r1H, r1L)
+p2 = pdPos(r2H, r2L)
+p3 = pdPos(r3H, r3L)
+p4 = pdPos(r4H, r4L)
+z1 = pdZone(p1)
+z2 = pdZone(p2)
+z3 = pdZone(p3)
+z4 = pdChart ? pdZone(p4) : 0
+pdSum = z1 + z2 + z3 + z4
+pdOk(int d) =>
+    pdMode == "Off" ? true : pdMode == "All timeframes agree" ? (z1 == d and z2 == d and z3 == d and (not pdChart or z4 == d)) : d * pdSum >= pdMin
+bias = biasSrc == "Premium/discount of TF 1" ? z1 : htfBias
+
+// ───────── Dynamic risk: equity vs start, drawdown from peak, last-N trade result
+var float eqPeak = strategy.initial_capital
+eqPeak := math.max(eqPeak, strategy.equity)
+growth = strategy.equity / strategy.initial_capital - 1
+mEq = growth >= 0 ? 1 + upStep * growth * 10 : 1 + dnStep * growth * 10
+ddNow = eqPeak > 0 ? 1 - strategy.equity / eqPeak : 0.0
+mDd = math.max(0.25, 1 - ddStep * ddNow * 10)
+var array<float> tRes = array.new<float>()
+var float npAtEntry = 0.0
+posNow = strategy.position_size
+if posNow != 0 and nz(posNow[1]) == 0
+    npAtEntry := nz(strategy.netprofit[1])
+if posNow == 0 and nz(posNow[1]) != 0
+    array.push(tRes, strategy.netprofit - npAtEntry)
+    if array.size(tRes) > math.max(perfN, 1)
+        array.shift(tRes)
+perfSum = array.size(tRes) > 0 ? array.sum(tRes) : 0.0
+mPerf = perfN > 0 and array.size(tRes) >= math.min(perfN, 3) ? (perfSum > 0 ? 1 + perfK : perfSum < 0 ? 1 - perfK : 1.0) : 1.0
+riskPct = math.max(minRisk, math.min(maxRisk, baseRisk * mEq * mDd * mPerf))
+dynSize = sizeMode == "Dynamic % risk"
+
+f_seriesOpen(bool up) =>
+    int s = 0
+    while s < 10 and (up ? close[s] <= open[s] : close[s] >= open[s])
+        s += 1
+    int e = s
+    while e < 30 and (up ? close[e + 1] > open[e + 1] : close[e + 1] < open[e + 1])
+        e += 1
+    open[e]
+
+f_amdx(int q) =>
+    q == 1 ? "A accumulation" : q == 2 ? "M manipulation" : q == 3 ? "D distribution" : "X continuation/reversal"
+
+// ───────── Time grid (New York): trading day 18:00 -> 18:00
+tz    = "America/New_York"
+nyMin = hour(time, tz) * 60 + minute(time, tz)
+sinceOpen = (nyMin - 18 * 60 + 1440) % 1440
+dayQ  = int(math.floor(sinceOpen / 360)) + 1
+q90   = int(math.floor((sinceOpen % 360) / 90)) + 1
+cycId = cyc == "90 minutes" ? int(math.floor(sinceOpen / 90)) : dayQ
+qIdx  = cyc == "90 minutes" ? q90 : dayQ
+newQ  = cycId != cycId[1] or timeframe.change("D")
+
+var float dayTO = na   // daily true open = 00:00 NY (start of daily Q2)
+if sinceOpen == 360 or (sinceOpen > 360 and sinceOpen[1] < 360)
+    dayTO := open
+
+// ───────── Quarter statistics, observed phase, SSMT
+var float qH = na
+var float qL = na
+var float qO = na
+var int   qHb = na
+var int   qLb = na
+var float oqH = na
+var float oqL = na
+var float pH = na
+var float pL = na
+var int   pHb = na
+var int   pLb = na
+var float poH = na
+var float poL = na
+var float[] rngs = array.new<float>()
+var string lastPhase = "-"
+var int    lastDir = 0
+var bool   ssBear = false
+var bool   ssBull = false
+
+if newQ
+    if not na(qH)
+        rng  = qH - qL
+        base = array.size(rngs) > 0 ? array.avg(rngs) : rng
+        sweptH = not na(pH) and qH > pH
+        sweptL = not na(pL) and qL < pL
+        qC  = close[1]
+        pos = rng > 0 ? (qC - qL) / rng : 0.5
+        prevPhase = lastPhase
+        prevDir = lastDir
+        string ph_ = "RETR"
+        int d = 0
+        if sweptH and sweptL
+            ph_ := "REV"
+            d := pos > 0.5 ? 1 : -1
+        else if rng < consK * base and not sweptH and not sweptL
+            ph_ := "CONS"
+        else if (sweptH and pos < 0.4) or (sweptL and pos > 0.6)
+            ph_ := "MANIP"
+            d := sweptH ? -1 : 1
+        else if rng > expK * base and ((sweptH and pos >= 0.7) or (sweptL and pos <= 0.3))
+            ph_ := "EXP"
+            d := sweptH ? 1 : -1
+        else if prevPhase == "EXP" and rng >= base and ((prevDir == 1 and pos <= 0.25) or (prevDir == -1 and pos >= 0.75))
+            ph_ := "REV"
+            d := -prevDir
+        else
+            d := qC > qO ? 1 : -1
+        lastPhase := ph_
+        lastDir := d
+        array.push(rngs, rng)
+        if array.size(rngs) > avgN
+            array.shift(rngs)
+        pH := qH
+        pL := qL
+        pHb := qHb
+        pLb := qLb
+        poH := oqH
+        poL := oqL
+    qH := high
+    qL := low
+    qO := open
+    qHb := bar_index
+    qLb := bar_index
+    oqH := oHi
+    oqL := oLo
+    ssBear := false
+    ssBull := false
+    if showQ
+        line.new(bar_index, low, bar_index, high, extend = extend.both, color = color.new(color.gray, qIdx == 1 ? 40 : 80), style = qIdx == 1 ? line.style_solid : line.style_dotted, force_overlay = true)
+else
+    if high > qH
+        qH := high
+        qHb := bar_index
+    if low < qL
+        qL := low
+        qLb := bar_index
+    oqH := math.max(oqH, oHi)
+    oqL := math.min(oqL, oLo)
+
+// SSMT: current quarter vs the previous completed quarter (one index takes the prior quarter extreme, the other does not)
+bearNow = not na(pH) and not na(poH) and ((qH > pH and oqH <= poH) or (qH <= pH and oqH > poH))
+bullNow = not na(pL) and not na(poL) and ((qL < pL and oqL >= poL) or (qL >= pL and oqL < poL))
+if bearNow and not ssBear
+    ssBear := true
+    line.new(pHb, pH, qHb, qH, color = color.orange, width = 2, force_overlay = true)
+    label.new(qHb, qH, "SSMT▼", color = color.new(color.orange, 100), textcolor = color.orange, style = label.style_label_down, size = size.small, force_overlay = true)
+if bullNow and not ssBull
+    ssBull := true
+    line.new(pLb, pL, qLb, qL, color = color.aqua, width = 2, force_overlay = true)
+    label.new(qLb, qL, "SSMT▲", color = color.new(color.aqua, 100), textcolor = color.aqua, style = label.style_label_up, size = size.small, force_overlay = true)
+
+// ───────── Liquidity rays (horizontal rays from each swing; stop at the sweep)
+ph = ta.pivothigh(high, swLen, swLen)
+pl = ta.pivotlow(low, swLen, swLen)
+var line[]  bL = array.new<line>()
+var float[] bP = array.new<float>()
+var int[]   bB = array.new<int>()
+var float[] bO = array.new<float>()
+var line[]  sL = array.new<line>()
+var float[] sP = array.new<float>()
+var int[]   sB = array.new<int>()
+var float[] sO = array.new<float>()
+var float lastSL = na
+var float lastSH = na
+
+// relative-equal registry: only the outermost live EQH (highest) and EQL (lowest) stay marked
+var float[] eqhP = array.new<float>()
+var label[] eqhLb = array.new<label>()
+var line[]  eqhA = array.new<line>()
+var line[]  eqhB = array.new<line>()
+var float[] eqlP = array.new<float>()
+var label[] eqlLb = array.new<label>()
+var line[]  eqlA = array.new<line>()
+var line[]  eqlB = array.new<line>()
+
+f_regEq(float[] ps, label[] lbs, line[] la, line[] lb, float p, label l, line a, line b) =>
+    array.push(ps, p)
+    array.push(lbs, l)
+    array.push(la, a)
+    array.push(lb, b)
+    if array.size(ps) > 20
+        array.shift(ps)
+        label.delete(array.shift(lbs))
+        array.shift(la)
+        array.shift(lb)
+
+// drop swept pools, then show only the extreme one
+f_showEq(float[] ps, label[] lbs, line[] la, line[] lb, bool isHigh, string txt) =>
+    int i = array.size(ps) - 1
+    while i >= 0
+        if isHigh ? high >= array.get(ps, i) + mt : low <= array.get(ps, i) - mt
+            label.delete(array.get(lbs, i))
+            array.remove(ps, i)
+            array.remove(lbs, i)
+            array.remove(la, i)
+            array.remove(lb, i)
+        i -= 1
+    int best = -1
+    for [j, p] in ps
+        if best < 0 or (isHigh ? p > array.get(ps, best) : p < array.get(ps, best))
+            best := j
+    for [j, p] in ps
+        on = j == best
+        label.set_text(array.get(lbs, j), on ? txt : "")
+        line.set_width(array.get(la, j), on ? 2 : 1)
+        line.set_width(array.get(lb, j), on ? 2 : 1)
+
+// OC candidate produced this bar
+float cHi = na
+float cLo = na
+int   cLeft = na
+bool  cEqh = false
+bool  cEql = false
+
+f_countNear(float[] ps, int[] bs, float level, int fromBar) =>
+    int n = 0
+    for [i, p] in ps
+        if math.abs(p - level) <= tol and array.get(bs, i) >= fromBar
+            n += 1
+    n
+
+if not na(ph)
+    pb = bar_index - swLen
+    lastSH := ph
+    int eqI = -1
+    for [i, p] in bP
+        gap = pb - array.get(bB, i)
+        if math.abs(p - ph) <= tol and gap >= ocMinBars and gap <= ocMaxBars
+            eqI := i
+    ln = line.new(pb, ph, pb + 1, ph, extend = extend.right, color = colB, width = 1, force_overlay = true)
+    if eqI >= 0
+        aB = array.get(bB, eqI)
+        f_regEq(eqhP, eqhLb, eqhA, eqhB, math.max(ph, array.get(bP, eqI)), label.new(pb, ph, "", color = color.new(colB, 100), textcolor = colB, style = label.style_label_down, size = size.tiny, force_overlay = true), ln, array.get(bL, eqI))
+        float lo_ = low[swLen]
+        for k = swLen to bar_index - aB
+            lo_ := math.min(lo_, low[k])
+        cHi := math.max(ph, array.get(bP, eqI))
+        cLo := lo_
+        cLeft := aB
+        cEqh := true
+        cEql := f_countNear(sP, sB, lo_, aB) >= 2
+    array.push(bL, ln)
+    array.push(bP, ph)
+    array.push(bB, pb)
+    array.push(bO, oHpiv)
+    if array.size(bP) > maxRays
+        line.delete(array.shift(bL))
+        array.shift(bP)
+        array.shift(bB)
+        array.shift(bO)
+
+if not na(pl)
+    pb = bar_index - swLen
+    lastSL := pl
+    int eqI = -1
+    for [i, p] in sP
+        gap = pb - array.get(sB, i)
+        if math.abs(p - pl) <= tol and gap >= ocMinBars and gap <= ocMaxBars
+            eqI := i
+    ln = line.new(pb, pl, pb + 1, pl, extend = extend.right, color = colS, width = 1, force_overlay = true)
+    if eqI >= 0
+        aB = array.get(sB, eqI)
+        f_regEq(eqlP, eqlLb, eqlA, eqlB, math.min(pl, array.get(sP, eqI)), label.new(pb, pl, "", color = color.new(colS, 100), textcolor = colS, style = label.style_label_up, size = size.tiny, force_overlay = true), ln, array.get(sL, eqI))
+        float hi_ = high[swLen]
+        for k = swLen to bar_index - aB
+            hi_ := math.max(hi_, high[k])
+        if na(cHi) or aB > cLeft
+            cHi := hi_
+            cLo := math.min(pl, array.get(sP, eqI))
+            cLeft := aB
+            cEql := true
+            cEqh := f_countNear(bP, bB, hi_, aB) >= 2
+    array.push(sL, ln)
+    array.push(sP, pl)
+    array.push(sB, pb)
+    array.push(sO, oLpiv)
+    if array.size(sP) > maxRays
+        line.delete(array.shift(sL))
+        array.shift(sP)
+        array.shift(sB)
+        array.shift(sO)
+
+// sweeps (trade-through by >= 1 tick): returns the most extreme level taken this bar
+f_sweep(line[] ls, float[] ps, int[] bs, float[] os, bool isHigh) =>
+    float best = na
+    float bestO = na
+    int i = array.size(ps) - 1
+    while i >= 0
+        p = array.get(ps, i)
+        if isHigh ? high >= p + mt : low <= p - mt
+            if na(best) or (isHigh ? p > best : p < best)
+                best := p
+                bestO := array.get(os, i)
+            l = array.get(ls, i)
+            if keepTaken
+                line.set_extend(l, extend.none)
+                line.set_x2(l, bar_index)
+                line.set_style(l, line.style_dotted)
+            else
+                line.delete(l)
+            array.remove(ls, i)
+            array.remove(ps, i)
+            array.remove(bs, i)
+            array.remove(os, i)
+        i -= 1
+    [best, bestO]
+
+[bslTaken, bslO] = f_sweep(bL, bP, bB, bO, true)
+[sslTaken, sslO] = f_sweep(sL, sP, sB, sO, false)
+f_showEq(eqhP, eqhLb, eqhA, eqhB, true, "EQH")
+f_showEq(eqlP, eqlLb, eqlA, eqlB, false, "EQL")
+
+// ───────── Original consolidation: latest valid EQH/EQL cluster, kept until price departs with displacement
+var float ocHi = na
+var float ocLo = na
+var int   ocLeft = na
+var bool  ocLive = false
+var box   ocBox = na
+inOcS = not na(time(timeframe.period, ocSess, tz))
+var float wH = na
+var float wL = na
+var int   wB = na
+if inOcS and not inOcS[1]
+    wH := high
+    wL := low
+    wB := bar_index
+else if inOcS
+    wH := math.max(wH, high)
+    wL := math.min(wL, low)
+sessEnd = not inOcS and inOcS[1] and not na(wB)
+
+okSides = ocMode == "EQH or EQL" ? (cEqh or cEql) : (cEqh and cEql)
+if sessEnd and ocSrc != "EQ cluster"
+    if ocLive
+        box.delete(ocBox)
+    ocHi := wH
+    ocLo := wL
+    ocLeft := wB
+    ocLive := true
+    nH = f_countNear(bP, bB, wH, wB)
+    nL = f_countNear(sP, sB, wL, wB)
+    tagS = "OC session" + (nH >= 2 ? " EQH" : "") + (nL >= 2 ? " EQL" : "")
+    ocBox := box.new(wB, wH, bar_index, wL, border_color = color.new(color.lime, 20), bgcolor = color.new(color.lime, 85), text = tagS, text_size = size.small, text_color = color.green, text_halign = text.align_left, text_valign = text.align_top, force_overlay = true)
+else if ocSrc != "Session window" and not na(cHi) and okSides and cHi - cLo > 0 and cHi - cLo <= ocMaxK * atr and (not ocLive or cLeft >= ocLeft)
+    if ocLive
+        box.delete(ocBox)
+    ocHi := cHi
+    ocLo := cLo
+    ocLeft := cLeft
+    ocLive := true
+    tag = "OC" + (cEqh and cEql ? " ★ EQH+EQL" : cEqh ? " EQH" : " EQL")
+    ocBox := box.new(ocLeft, ocHi, bar_index, ocLo, border_color = color.new(color.orange, 20), bgcolor = color.new(color.orange, 88), text = tag, text_size = size.small, text_color = color.orange, text_halign = text.align_left, text_valign = text.align_top, force_overlay = true)
+
+// model after departure: +1 = departed up (buy-side curve, sell model armed), -1 = departed down (buy model armed)
+var int   mDir = 0
+var float mHi = na
+var float mLo = na
+var int   mBar = na
+var int   accN = 0
+if ocLive
+    box.set_right(ocBox, bar_index)
+    upDep = close > ocHi and close - open >= dispK * atr
+    dnDep = close < ocLo and open - close >= dispK * atr
+    if upDep or dnDep
+        ocLive := false
+        mDir := upDep ? 1 : -1
+        mHi := ocHi
+        mLo := ocLo
+        mBar := bar_index
+        accN := 0
+        label.new(bar_index, upDep ? high : low, upDep ? "OC break ▲" : "OC break ▼", color = color.new(color.orange, 100), textcolor = color.orange, style = upDep ? label.style_label_down : label.style_label_up, size = size.tiny, force_overlay = true)
+    else if bar_index - ocLeft > 2 * ocMaxBars
+        ocLive := false
+
+// ───────── SMR: raid of liquidity beyond the OC (in HTF premium / discount) + confirmation score
+bullFvg = low > high[2]
+bearFvg = high < low[2]
+var float lbfBot = na
+var float lsfTop = na
+if bullFvg
+    lbfBot := high[2]
+if bearFvg
+    lsfTop := low[2]
+
+f_macro(t) =>
+    m = minute(t, tz)
+    m >= 50 or m < 10
+
+var int   rDir = 0      // 1 = watching a sell-model SMR, -1 = buy-model SMR
+var float rExt = na
+var int   rBar = na
+var float rCisd = na
+var float rMss = na
+var float rIfvg = na
+var bool  rMac = false
+var bool  rPt = false
+var bool  rTw = false
+
+if mDir == 1 and rDir == 0 and not na(bslTaken) and bslTaken > mHi and (not zoneOn or high > eq)
+    rDir := 1
+    rExt := high
+    rBar := bar_index
+    rCisd := f_seriesOpen(true)
+    rMss := lastSL
+    rIfvg := lbfBot
+    rMac := f_macro(time)
+    rPt := not na(bslO) and oH3 < bslO
+    rTw := not na(time(timeframe.period, smrSess, tz))
+if mDir == -1 and rDir == 0 and not na(sslTaken) and sslTaken < mLo and (not zoneOn or low < eq)
+    rDir := -1
+    rExt := low
+    rBar := bar_index
+    rCisd := f_seriesOpen(false)
+    rMss := lastSH
+    rIfvg := lsfTop
+    rMac := f_macro(time)
+    rPt := not na(sslO) and oL3 > sslO
+    rTw := not na(time(timeframe.period, smrSess, tz))
+
+var bool fC = false
+var bool fM = false
+var bool fI = false
+var int   postDir = 0
+var int   postBar = na
+var float postTgt = na
+var int   distN = 0
+var float prevSw = na
+var float prevSwO = na
+var int   pDir = 0
+var float pStop = na
+var float pLim = na
+var float pDraw = na
+var float pNear = na
+var int   pBar = na
+var string pTag = ""
+if rDir != 0
+    if bar_index == rBar
+        fC := false
+        fM := false
+        fI := false
+    if rDir == 1 and high > rExt
+        rExt := high
+        rCisd := f_seriesOpen(true)
+        fC := false
+        fM := false
+        fI := false
+    if rDir == -1 and low < rExt
+        rExt := low
+        rCisd := f_seriesOpen(false)
+        fC := false
+        fM := false
+        fI := false
+    fC := fC or (rDir == 1 ? low <= rCisd - mt : high >= rCisd + mt)
+    fM := fM or (not na(rMss) and (rDir == 1 ? low <= rMss - mt : high >= rMss + mt))
+    fI := fI or (not na(rIfvg) and (rDir == 1 ? close < rIfvg : close > rIfvg))
+    ss = rDir == 1 ? ssBear : ssBull
+    hq = rDir == 1 ? rExt >= hLo + 0.75 * (hHi - hLo) : rExt <= hLo + 0.25 * (hHi - hLo)
+    score = (fC ? 2.0 : 0) + (fI ? 2.0 : 0) + (fM ? 1.5 : 0) + (ss ? 1.5 : 0) + (rPt ? 1.5 : 0) + (hq ? 1.0 : 0) + (rMac ? 0.5 : 0) + (rTw ? 0.5 : 0)
+    if score >= confMin
+        comp = (fC ? "C" : "") + (fI ? "I" : "") + (fM ? "M" : "") + (ss ? "S" : "") + (rPt ? "P" : "") + (hq ? "H" : "") + (rMac ? "m" : "") + (rTw ? "T" : "")
+        col = rDir == 1 ? color.maroon : color.teal
+        label.new(bar_index, rExt, (rDir == 1 ? "SMR ▼ " : "SMR ▲ ") + str.tostring(score, "#.0") + " " + comp, color = color.new(col, 100), textcolor = col, style = rDir == 1 ? label.style_label_down : label.style_label_up, size = size.small, force_overlay = true)
+        tgt = rDir == 1 ? mLo : mHi
+        line.new(bar_index, tgt, bar_index + 30, tgt, color = col, style = line.style_dashed, width = 2, force_overlay = true)
+        label.new(bar_index + 30, tgt, "draw: OC " + (rDir == 1 ? "low" : "high"), color = color.new(col, 100), textcolor = col, style = label.style_label_left, size = size.tiny, force_overlay = true)
+        pDir := rDir == 1 ? -1 : 1
+        pStop := rDir == 1 ? rExt + stopPad * mt : rExt - stopPad * mt
+        pLim := fI ? rIfvg : na
+        pDraw := tgt
+        pNear := rDir == 1 ? mHi : mLo
+        pBar := bar_index
+        pTag := (rDir == 1 ? "MMSM " : "MMBM ") + str.tostring(score, "#.0") + " " + comp
+        postDir := rDir == 1 ? -1 : 1
+        postBar := bar_index
+        postTgt := tgt
+        distN := 0
+        prevSw := na
+        prevSwO := na
+        rDir := 0
+        mDir := 0
+    else if bar_index - rBar > smrWin
+        rDir := 0
+
+// ───────── Phase boxes (pane): row 1 = 90-min quarters, row 2 = 6-hour quarters of the 18:00 NY day
+// ───────── Stage labels (Dawacadu naming): pullbacks on the curve before the SMR = Acc. n, after the SMR = Dist. n;
+// a Dist. swing that diverges from the correlated index vs the previous Dist. swing = stage divergence (second entry)
+if showStg and mDir != 0
+    if mDir == 1 and not na(pl) and bar_index - swLen > mBar and pl > mHi
+        accN += 1
+        label.new(bar_index - swLen, pl, "Acc. " + str.tostring(accN), color = color.new(color.gray, 100), textcolor = color.gray, style = label.style_label_up, size = size.tiny, force_overlay = true)
+    if mDir == -1 and not na(ph) and bar_index - swLen > mBar and ph < mLo
+        accN += 1
+        label.new(bar_index - swLen, ph, "Acc. " + str.tostring(accN), color = color.new(color.gray, 100), textcolor = color.gray, style = label.style_label_down, size = size.tiny, force_overlay = true)
+if postDir != 0
+    float sw = postDir == 1 ? pl : ph
+    float swO = postDir == 1 ? oLpiv : oHpiv
+    if showStg and not na(sw) and bar_index - swLen > postBar
+        distN += 1
+        div = not na(prevSw) and (postDir == 1 ? ((sw < prevSw and swO >= prevSwO) or (sw >= prevSw and swO < prevSwO)) : ((sw > prevSw and swO <= prevSwO) or (sw <= prevSw and swO > prevSwO)))
+        col2 = div ? color.fuchsia : color.gray
+        label.new(bar_index - swLen, sw, "Dist. " + str.tostring(distN) + (div ? " · SMT" : ""), color = color.new(col2, 100), textcolor = col2, style = postDir == 1 ? label.style_label_up : label.style_label_down, size = size.tiny, force_overlay = true)
+        prevSw := sw
+        prevSwO := swO
+    if (postDir == 1 and high >= postTgt) or (postDir == -1 and low <= postTgt) or distN > 4 or bar_index - postBar > 400
+        postDir := 0
+
+// ───────── Orders: low-risk entry after SMR (IFVG retest limit if the IFVG fired, else market), stop beyond SMR,
+// TP1 = nearest opposite liquidity ray >= minRoom away (fallback OC near edge / event horizon), TP2 = OC near edge, runner = OC far side
+nyH = hour(time, tz)
+nyM = minute(time, tz)
+flatNow = flatOn and timeframe.isintraday and (nyH > 15 or (nyH == 15 and nyM >= 55)) and nyH < 18
+phBase = array.size(rngs) > 0 ? array.avg(rngs) : 0.0
+phBlock = lastPhase == "CONS" and (qH - qL) < phBase
+canT = (not macroOn or f_macro(time_close)) and not flatNow and (not phaseGate or not phBlock)
+
+var float tStop = na
+var float tT1 = na
+var float tT2 = na
+var float tDraw = na
+var string tId = "L"
+var int tQty = 0
+var int tQ1 = 0
+var int tQ2 = 0
+curPos = strategy.position_size
+limitOnly = entryType == "Limit only (IFVG / first FVG)"
+if pDir != 0 and curPos == 0 and na(pLim) and limitOnly and bar_index > pBar
+    if pDir == -1 and bearFvg
+        pLim := high
+    if pDir == 1 and bullFvg
+        pLim := low
+isCT = bias != 0 and pDir != 0 and pDir != bias
+if pDir != 0 and curPos == 0 and isCT and ctMode == "Skip"
+    pDir := 0
+if pDir != 0 and curPos == 0
+    eRef = na(pLim) ? close : pLim
+    float stp = pDir == -1 ? math.max(pStop, eRef + minStopK * atr) : math.min(pStop, eRef - minStopK * atr)
+    capT = isCT and ctMode == "Cap at RR" ? eRef + pDir * ctRR * math.abs(eRef - stp) : na
+    float t1 = na
+    if pDir == -1
+        for p in sP
+            if p < eRef - minRoom and p > pDraw and (na(t1) or p > t1)
+                t1 := p
+        if na(t1) and pNear < eRef - minRoom and pNear > pDraw
+            t1 := pNear
+        if na(t1) and eRef - pDraw > 2 * minRoom
+            t1 := (eRef + pDraw) / 2
+    else
+        for p in bP
+            if p > eRef + minRoom and p < pDraw and (na(t1) or p < t1)
+                t1 := p
+        if na(t1) and pNear > eRef + minRoom and pNear < pDraw
+            t1 := pNear
+        if na(t1) and pDraw - eRef > 2 * minRoom
+            t1 := (eRef + pDraw) / 2
+    float t2 = na
+    if not na(t1)
+        t2 := pDir == -1 ? (pNear < t1 and pNear > pDraw ? pNear : (t1 + pDraw) / 2) : (pNear > t1 and pNear < pDraw ? pNear : (t1 + pDraw) / 2)
+    float dr = pDraw
+    if not na(capT)
+        t1 := na(t1) ? capT : pDir == 1 ? math.min(t1, capT) : math.max(t1, capT)
+        t2 := na(t2) ? capT : pDir == 1 ? math.min(t2, capT) : math.max(t2, capT)
+        dr := pDir == 1 ? math.min(dr, capT) : math.max(dr, capT)
+    perC = math.abs(eRef - stp) * syminfo.pointvalue + 2 * 2.5 + 2 * mt * syminfo.pointvalue
+    riskUSD = strategy.equity * riskPct / 100 * (isCT ? ctRiskK : 1.0)
+    int qty = dynSize ? math.min(maxQty, int(math.floor(riskUSD / perC))) : nQty
+    int a1 = dynSize ? (qty >= 2 ? math.max(1, int(math.round(qty * tp1Pct / 100))) : qty) : q1
+    int a2 = dynSize ? (qty >= 3 ? math.max(1, int(math.round(qty * tp2Pct / 100))) : 0) : q2
+    if a1 + a2 > qty
+        a2 := math.max(0, qty - a1)
+    ok = not na(t1) and (pDir == -1 ? eRef < stp : eRef > stp) and (not limitOnly or not na(pLim)) and qty >= 1 and pdOk(pDir)
+    gone = bar_index - pBar > armBars or (pDir == -1 ? high >= stp : low <= stp) or (not na(t1) and (pDir == -1 ? low <= t1 : high >= t1))
+    eId = pDir == 1 ? "L" : "S"
+    if gone
+        strategy.cancel(eId)
+        pDir := 0
+    else if ok and canT
+        tStop := stp
+        tT1 := t1
+        tT2 := t2
+        tDraw := dr
+        tId := eId
+        tQty := qty
+        tQ1 := a1
+        tQ2 := a2
+        strategy.cancel(pDir == 1 ? "S" : "L")
+        strategy.entry(eId, pDir == 1 ? strategy.long : strategy.short, qty = qty, limit = pLim, comment = pTag + (isCT ? " CT" : " WT") + " r" + str.tostring(riskPct * (isCT ? ctRiskK : 1.0), "#.#") + "%")
+        strategy.exit(eId + "-T1", eId, qty = a1, limit = tT1, stop = tStop, comment_profit = "TP1", comment_loss = "SL")
+        if a2 > 0
+            strategy.exit(eId + "-T2", eId, qty = a2, limit = tT2, stop = tStop, comment_profit = "TP2", comment_loss = "SL")
+        strategy.exit(eId + "-R", eId, limit = tDraw, stop = tStop, comment_profit = "OC", comment_loss = "SL")
+    else
+        strategy.cancel(eId)
+if curPos != 0
+    pDir := 0
+    openQ = math.abs(curPos)
+    st = openQ < tQty ? strategy.position_avg_price : tStop
+    strategy.cancel(tId == "L" ? "S" : "L")
+    if openQ == tQty
+        strategy.exit(tId + "-T1", tId, qty = tQ1, limit = tT1, stop = st, comment_profit = "TP1", comment_loss = "SL")
+    if tQ2 > 0 and openQ > tQty - tQ1 - tQ2
+        strategy.exit(tId + "-T2", tId, qty = tQ2, limit = tT2, stop = st, comment_profit = "TP2", comment_loss = "SL/BE")
+    strategy.exit(tId + "-R", tId, limit = tDraw, stop = st, comment_profit = "OC", comment_loss = "SL/BE")
+if flatNow
+    strategy.cancel("L")
+    strategy.cancel("S")
+    pDir := 0
+    if curPos != 0
+        strategy.close_all(comment = "flat")
+
+plot(eq, "HTF EQ", color.new(color.gray, 50), 1, plot.style_stepline, force_overlay = true)
+plot(dayTO, "Day true open", color.new(color.yellow, 40), 1, plot.style_linebr, force_overlay = true)
+
+// ───────── Premium / discount matrix + risk table
+var table pdT = table.new(position.top_right, 3, 8, bgcolor = color.new(color.black, 20), border_width = 1)
+f_zTxt(int z) =>
+    z == 1 ? "DISCOUNT" : z == -1 ? "PREMIUM" : "EQ"
+f_zCol(int z) =>
+    z == 1 ? color.new(color.teal, 30) : z == -1 ? color.new(color.red, 30) : color.new(color.gray, 50)
+f_row(int r, string tf, float p, int z) =>
+    table.cell(pdT, 0, r, tf, text_color = color.white, text_size = size.small)
+    table.cell(pdT, 1, r, na(p) ? "-" : str.tostring(p * 100, "#") + "%", text_color = color.white, text_size = size.small)
+    table.cell(pdT, 2, r, f_zTxt(z), text_color = color.white, bgcolor = f_zCol(z), text_size = size.small)
+if showPD and barstate.islast
+    table.cell(pdT, 0, 0, "TF", text_color = color.white, text_size = size.small)
+    table.cell(pdT, 1, 0, "Range %", text_color = color.white, text_size = size.small)
+    table.cell(pdT, 2, 0, "Zone", text_color = color.white, text_size = size.small)
+    f_row(1, pdTF1, p1, z1)
+    f_row(2, pdTF2, p2, z2)
+    f_row(3, pdTF3, p3, z3)
+    f_row(4, pdChart ? timeframe.period : "-", pdChart ? p4 : na, z4)
+    table.cell(pdT, 0, 5, "Net", text_color = color.white, text_size = size.small)
+    table.cell(pdT, 1, 5, str.tostring(pdSum), text_color = color.white, text_size = size.small)
+    table.cell(pdT, 2, 5, pdOk(1) ? "BUYS OK" : pdOk(-1) ? "SELLS OK" : "WAIT", text_color = color.white, bgcolor = pdOk(1) ? color.new(color.teal, 30) : pdOk(-1) ? color.new(color.red, 30) : color.new(color.orange, 40), text_size = size.small)
+    table.cell(pdT, 0, 6, "HTF bias", text_color = color.white, text_size = size.small)
+    table.cell(pdT, 2, 6, bias == 1 ? "BUY side" : bias == -1 ? "SELL side" : "neutral", text_color = color.white, text_size = size.small)
+    table.cell(pdT, 0, 7, "Risk", text_color = color.white, text_size = size.small)
+    table.cell(pdT, 1, 7, dynSize ? str.tostring(riskPct, "#.##") + "%" : "fixed", text_color = color.white, text_size = size.small)
+    table.cell(pdT, 2, 7, "eq " + str.tostring(strategy.equity, "#"), text_color = color.white, text_size = size.small)
